@@ -354,6 +354,13 @@
     "setNewUserId": true,
     "uploadFile": true,
     "feedback": true,
-    "uploadConfig": true
+    "uploadConfig": true,
+    "DirectiveBinding": true,
+    "MaybeRef": true,
+    "MaybeRefOrGetter": true,
+    "onWatcherCleanup": true,
+    "useId": true,
+    "useModel": true,
+    "useTemplateRef": true
   }
 }

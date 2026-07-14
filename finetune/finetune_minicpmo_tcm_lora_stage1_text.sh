@@ -15,7 +15,6 @@ DATA="${DATA:-$PROJECT_DIR/outputs/medical_sft_minicpmo/tcm_consult_minicpmo_tra
 EVAL_DATA="${EVAL_DATA:-$PROJECT_DIR/outputs/medical_sft_minicpmo/tcm_consult_minicpmo_val.json}"
 OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/outputs/tcm_minicpmo_lora_stage1_text}"
 LOGGING_DIR="${LOGGING_DIR:-$OUTPUT_DIR/logs}"
-export TENSORBOARD_LOGGING_DIR="${TENSORBOARD_LOGGING_DIR:-$LOGGING_DIR}"
 
 LLM_TYPE="qwen"
 MODEL_MAX_LENGTH="${MODEL_MAX_LENGTH:-4096}"
@@ -61,15 +60,15 @@ torchrun $DISTRIBUTED_ARGS finetune.py \
     --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE:-1}" \
     --per_device_eval_batch_size "${PER_DEVICE_EVAL_BATCH_SIZE:-1}" \
     --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-8}" \
-    --eval_strategy "steps" \
+    --evaluation_strategy "steps" \
     --save_strategy "steps" \
     --save_total_limit 5 \
     --learning_rate "${LEARNING_RATE:-2e-5}" \
     --weight_decay 0.01 \
     --adam_beta2 0.95 \
-    --warmup_steps "${WARMUP_STEPS:-100}" \
+    --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
     --logging_steps 10 \
     --gradient_checkpointing true \
     --deepspeed ds_config_zero2.json \
-    --report_to "${REPORT_TO:-none}"
+    --report_to "tensorboard"

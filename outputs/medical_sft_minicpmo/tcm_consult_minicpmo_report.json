@@ -1,5 +1,5 @@
 {
-  "input": "outputs/medical_sft/wuweiping_medical_consult_sft.json",
+  "input": "outputs/medical_sft/wuweiping_medical_consult.json",
   "image_manifest": null,
   "total": 912,
   "train": 730,
