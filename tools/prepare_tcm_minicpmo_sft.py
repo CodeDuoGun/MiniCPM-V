@@ -32,10 +32,6 @@ import argparse
 import json
 import random
 from pathlib import Path
-<<<<<<< HEAD
-from tkinter import NO
-=======
->>>>>>> 35328b7 ([MOD] 微调中医图文问诊)
 from typing import Any, Dict, List, Optional, Tuple
 
 
