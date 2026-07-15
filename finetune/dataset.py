@@ -51,11 +51,13 @@ class SupervisedDataset(Dataset):
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         try:
-            if isinstance(self.raw_data[i]["image"], str):
-                images_dict = { "<image>" : Image.open(self.raw_data[i]["image"]).convert("RGB") }
-            elif isinstance(self.raw_data[i]["image"], Dict):
+            image_data = self.raw_data[i].get("image")
+            images_dict = {}
+            if isinstance(image_data, str):
+                images_dict = { "<image>" : Image.open(image_data).convert("RGB") }
+            elif isinstance(image_data, Dict):
                 ### for multi-images input, the template for every image is <image_xx>, such as <image_00>, <image_01>
-                images_dict = {img_name : Image.open(img_path).convert("RGB") for img_name, img_path in self.raw_data[i]["image"].items()}
+                images_dict = {img_name : Image.open(img_path).convert("RGB") for img_name, img_path in image_data.items()}
                 
             ret = preprocess(
                 images_dict,
@@ -79,9 +81,10 @@ class SupervisedDataset(Dataset):
                 tgt_sizes=ret["tgt_sizes"],
                 image_bound=ret["image_bound"],
             )
-        except:
-            logger.error(f"data fetch error")
-            return self.__getitem__(random.randint(0, len(self))) 
+        except Exception as exc:
+            sample_id = self.raw_data[i].get("id", i) if isinstance(self.raw_data[i], dict) else i
+            logger.exception(f"data fetch error at index={i}, id={sample_id}")
+            raise RuntimeError(f"Failed to fetch sample index={i}, id={sample_id}") from exc
         return ret
 
         

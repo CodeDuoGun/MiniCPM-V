@@ -1,0 +1,9 @@
+{
+  "input": "outputs/medical_sft/wuweiping_medical_consult_sft.json",
+  "image_manifest": null,
+  "total": 912,
+  "train": 730,
+  "val": 91,
+  "test": 91,
+  "skipped": {}
+}

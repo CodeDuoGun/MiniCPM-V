@@ -1,0 +1,17 @@
+{
+  "input": "/Users/tangxueduo/Projects/LLaMA-Factory/medical/processed_data/wuweiping/wuweiping_postasr_speaker_content.json",
+  "total_records": 967,
+  "usable_samples": 912,
+  "train": 730,
+  "val": 91,
+  "test": 91,
+  "skipped": {
+    "empty_dialogue": 55
+  },
+  "options": {
+    "include_record_context": true,
+    "max_record_chars": 1200,
+    "remove_intent": true,
+    "desensitize": true
+  }
+}

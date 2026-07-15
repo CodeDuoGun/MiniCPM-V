@@ -223,8 +223,12 @@ def train():
         rank0_print("Currently using LoRA for fine-tuning the MiniCPM-V model.")
         for name, param in model.llm.named_parameters():
             param.requires_grad = False
-        modules_to_save = ['embed_tokens','resampler']
-        if training_args.tune_vision:
+        modules_to_save = [
+            module.strip()
+            for module in lora_args.lora_modules_to_save.split(",")
+            if module.strip()
+        ]
+        if training_args.tune_vision and "vpm" not in modules_to_save:
             modules_to_save.append('vpm')
         lora_config = LoraConfig(
             r=lora_args.lora_r,

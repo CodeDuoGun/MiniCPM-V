@@ -15,6 +15,10 @@ import logging
 import torch
 from PIL import Image
 from transformers import AutoModel, AutoTokenizer, AutoProcessor
+try:
+    from peft import PeftModel
+except ImportError:
+    PeftModel = None
 import uvicorn
 from fastapi import FastAPI, Header, Query, Request, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -56,7 +60,20 @@ logger = setup_logger()
 ap = argparse.ArgumentParser()
 ap.add_argument('--port', type=int , default=32550)
 ap.add_argument('--model', type=str , default="openbmb/MiniCPM-o-2_6", help="huggingface model name or local path")
+ap.add_argument('--adapter', type=str, default="", help="optional LoRA adapter path")
+ap.add_argument('--merge-lora', action='store_true', default=True, help="merge LoRA adapter into the base model for inference")
+ap.add_argument('--system-prompt', type=str, default="", help="assistant system prompt used for the realtime session")
 args = ap.parse_args()
+
+TCM_SYSTEM_PROMPT = (
+    "你是中医问诊助手，负责在初诊和复诊场景中进行真实、谨慎、连续的病情采集。"
+    "你需要围绕主诉、现病史、既往史、过敏史、当前用药和外用药反应、饮食、睡眠、二便、"
+    "寒热汗出、口渴口苦、疼痛性质、情绪压力、女性月经/孕产情况等逐步追问。"
+    "如果用户提供舌面、面部、患处或其他图片/视频，应结合可见信息提出后续问诊问题，但不要仅凭图片下最终诊断。"
+    "你的回答要像线上问诊医生一样简洁自然，一次优先问1到3个关键问题，避免长篇科普。"
+    "不要替代医生做最终诊断、不要直接开处方或承诺疗效；涉及急症、严重过敏、持续高热、胸痛、呼吸困难、意识异常、"
+    "孕产妇/儿童高风险情况时，应建议及时线下就医。"
+)
 
 
 class StreamManager:
@@ -94,6 +111,18 @@ class StreamManager:
         self.model_version = "2.6"
         with torch.no_grad():
             self.minicpmo_model = AutoModel.from_pretrained(self.minicpmo_model_path, trust_remote_code=True, torch_dtype=self.target_dtype, attn_implementation='sdpa')
+            if args.adapter:
+                if PeftModel is None:
+                    raise ImportError("peft is required when --adapter is provided. Please install peft first.")
+                logger.info(f"Loading LoRA adapter from {args.adapter}")
+                self.minicpmo_model = PeftModel.from_pretrained(
+                    self.minicpmo_model,
+                    args.adapter,
+                    torch_dtype=self.target_dtype,
+                )
+                if args.merge_lora:
+                    logger.info("Merging LoRA adapter for inference")
+                    self.minicpmo_model = self.minicpmo_model.merge_and_unload()
         self.minicpmo_tokenizer = AutoTokenizer.from_pretrained(self.minicpmo_model_path, trust_remote_code=True)
         self.minicpmo_model.init_tts()
         # self.minicpmo_model.tts.float()
@@ -209,9 +238,10 @@ class StreamManager:
         logger.info("### sys_prompt_init ###")
 
         logger.info(f'msg_type is {msg_type}')
+        tcm_assistant_prompt = args.system_prompt.strip() or TCM_SYSTEM_PROMPT
         if msg_type <= 1: #audio
             audio_voice_clone_prompt = "Use the voice in the audio prompt to synthesize new content."
-            audio_assistant_prompt = "You are a helpful assistant with the above voice style."
+            audio_assistant_prompt = tcm_assistant_prompt
             ref_path = self.ref_path_default
 
             
@@ -229,7 +259,7 @@ class StreamManager:
             sys_msg = {'role': 'user', 'content': [audio_voice_clone_prompt + "\n", audio_prompt, "\n" + audio_assistant_prompt]}
         elif msg_type == 2: #video
             voice_clone_prompt="你是一个AI助手。你能接受视频，音频和文本输入并输出语音和文本。模仿输入音频中的声音特征。"
-            assistant_prompt="作为助手，你将使用这种声音风格说话。"
+            assistant_prompt=tcm_assistant_prompt
             ref_path = self.ref_path_video_default
             
             if self.customized_options is not None:
