@@ -17,7 +17,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-$PROJECT_DIR/outputs/tcm_minicpmo_lora_stage1_text}"
 LOGGING_DIR="${LOGGING_DIR:-$OUTPUT_DIR/logs}"
 
 LLM_TYPE="qwen"
-MODEL_MAX_LENGTH="${MODEL_MAX_LENGTH:-4096}"
+MODEL_MAX_LENGTH="${MODEL_MAX_LENGTH:-8192}"
 
 DISTRIBUTED_ARGS="
     --nproc_per_node $GPUS_PER_NODE
@@ -46,13 +46,13 @@ torchrun $DISTRIBUTED_ARGS finetune.py \
     --tune_vision false \
     --tune_llm false \
     --use_lora true \
-    --lora_r 64 \
-    --lora_alpha 128 \
+    --lora_r 32 \
+    --lora_alpha 64 \
     --lora_dropout 0.05 \
     --lora_target_modules "llm\..*layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)" \
     --model_max_length "$MODEL_MAX_LENGTH" \
     --max_slice_nums 1 \
-    --max_steps "${MAX_STEPS:-500}" \
+    --max_steps "${MAX_STEPS:-250}" \
     --eval_steps "${EVAL_STEPS:-50}" \
     --save_steps "${SAVE_STEPS:-50}" \
     --output_dir "$OUTPUT_DIR" \

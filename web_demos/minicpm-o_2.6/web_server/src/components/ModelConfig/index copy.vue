@@ -178,7 +178,7 @@
                 defaultAssistantPrompt = '作为助手，你将使用这种声音风格说话。';
             } else {
                 defaultVoiceClonePrompt = '克隆音频提示中的音色以生成语音。';
-                defaultAssistantPrompt = 'Your task is to be a helpful assistant using this voice pattern.';
+                defaultAssistantPrompt = '请始终使用简体中文，并使用这种声音风格提供帮助。';
             }
             configData.value.voiceClonePrompt = defaultVoiceClonePrompt;
             configData.value.assistantPrompt = defaultAssistantPrompt;

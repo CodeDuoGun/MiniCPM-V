@@ -653,6 +653,9 @@
             useAudioPrompt,
             voiceClonePrompt,
             assistantPrompt,
+            patientGender,
+            patientAge,
+            visitType,
             vadThreshold,
             audioFormat,
             base64Str
@@ -676,7 +679,10 @@
                                 use_audio_prompt: useAudioPrompt,
                                 vad_threshold: vadThreshold,
                                 voice_clone_prompt: voiceClonePrompt,
-                                assistant_prompt: assistantPrompt
+                                assistant_prompt: assistantPrompt,
+                                patient_gender: patientGender,
+                                patient_age: patientAge,
+                                visit_type: visitType
                             }
                         }
                     ]

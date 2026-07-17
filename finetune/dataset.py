@@ -90,7 +90,13 @@ class SupervisedDataset(Dataset):
         
 def data_collator(examples, padding_value=0, max_length=2048):
     def trim_and_pad(seq, batch_first, padding_value):
-        return pad_sequence([s[:max_length] for s in seq], batch_first=True, padding_value=padding_value)
+        too_long = [len(s) for s in seq if len(s) > max_length]
+        if too_long:
+            raise ValueError(
+                f"Preprocessed sequence exceeds max_length={max_length}: {too_long}. "
+                "Refusing to truncate a completed assistant response in the collator."
+            )
+        return pad_sequence(seq, batch_first=batch_first, padding_value=padding_value)
 
     input_ids = trim_and_pad(
         [example["input_ids"] for example in examples],
@@ -147,10 +153,40 @@ def conversation_to_ids(conversation, tokenizer, llm_type=None, new_schema=False
 
     ids = torch.from_numpy(np.hstack(input_ids, dtype=np.int32))
     context = torch.from_numpy(np.hstack(context, dtype=np.int8))
-    if input_ids.shape[-1] > max_length:
-        ids =ids[:max_length]
-        context = context[:max_length]
-        logger.warning(f"The input length ({input_ids.shape[-1]}) exceeds the model's maximum length ({max_length}), so it has been truncated")
+    if len(ids) > max_length:
+        original_length = len(ids)
+        stop_token_ids = {
+            token_id
+            for token_id in (
+                getattr(tokenizer, "eos_token_id", None),
+                getattr(tokenizer, "eos_id", None),
+                getattr(tokenizer, "eot_id", None),
+                tokenizer.convert_tokens_to_ids("<|im_end|>"),
+                tokenizer.convert_tokens_to_ids("<|eot_id|>"),
+            )
+            if isinstance(token_id, int) and token_id >= 0
+        }
+        # 只允许在 assistant 已经生成停止符的位置截断，绝不保留半条回复。
+        completed_assistant_ends = [
+            idx + 1
+            for idx in range(min(max_length, len(ids)))
+            if context[idx] == 0 and int(ids[idx]) in stop_token_ids
+        ]
+        if not completed_assistant_ends:
+            raise ValueError(
+                f"Sequence length {original_length} exceeds max_length={max_length}, "
+                "but no complete assistant response fits in the window."
+            )
+        cut_at = completed_assistant_ends[-1]
+        ids = ids[:cut_at]
+        context = context[:cut_at]
+        logger.warning(
+            "The input length (%s) exceeds max_length=%s; truncated at a complete "
+            "assistant stop token (new length=%s).",
+            original_length,
+            max_length,
+            cut_at,
+        )
     
     if torch.all(context):
         logger.error("No tokens available to compute loss.")

@@ -86,6 +86,8 @@ TCM_IDENTITY_PROMPT = (
     "也不要主动讨论底层模型、训练机构或技术实现。"
 )
 
+CHINESE_VOICE_PROMPT = "模仿输入音频中的声音特征，并始终使用简体中文生成回复。"
+
 
 class StreamManager:
     def __init__(self):
@@ -150,7 +152,7 @@ class StreamManager:
         self.minicpmo_model.to(self.device).eval()
 
         self.ref_path_video_default = os.path.abspath(
-            os.path.join(cur_path, "../../data/Wuweiping_test3_处理后音频.m4a")
+            os.path.join(cur_path, "../../assets/ref_audios/Wuweiping_test3_ref_16k_mono.wav")
         )
         self.ref_path_default = "assets/ref_audios/default.wav"
         self.ref_path_female = "assets/ref_audios/female_example.wav"
@@ -265,15 +267,23 @@ class StreamManager:
 
         logger.info(f'msg_type is {msg_type}')
         tcm_assistant_prompt = args.system_prompt.strip() or TCM_SYSTEM_PROMPT
+        options = self.customized_options or {}
+        patient_gender = str(options.get("patient_gender") or options.get("gender") or "未知").strip()
+        patient_age = str(options.get("patient_age") or options.get("age") or "未知").strip()
+        visit_type = str(options.get("visit_type") or "未知").strip()
+        patient_context = (
+            f"当前用户基本信息：性别：{patient_gender}；年龄：{patient_age}；"
+            f"就诊类型：{visit_type}。请结合这些信息开始问诊，不要重复询问已经提供的信息。"
+        )
+        language_instruction = "无论用户使用何种语言，都必须始终使用简体中文回答。"
         if msg_type <= 1: #audio
-            audio_voice_clone_prompt = "Use the voice in the audio prompt to synthesize new content."
+            audio_voice_clone_prompt = CHINESE_VOICE_PROMPT
             audio_assistant_prompt = tcm_assistant_prompt
             ref_path = self.ref_path_default
 
             
             if self.customized_options is not None:
-                audio_voice_clone_prompt = self.customized_options['voice_clone_prompt']
-                audio_assistant_prompt = self.customized_options['assistant_prompt']
+                audio_assistant_prompt = self.customized_options.get('assistant_prompt') or tcm_assistant_prompt
                 if self.customized_options['use_audio_prompt'] == 1:
                     ref_path = self.ref_path_default
                 elif self.customized_options['use_audio_prompt'] == 2:
@@ -281,21 +291,26 @@ class StreamManager:
                 elif self.customized_options['use_audio_prompt'] == 3:
                     ref_path = self.ref_path_male
 
-            audio_assistant_prompt = f"{TCM_IDENTITY_PROMPT}\n{audio_assistant_prompt}"
+            audio_assistant_prompt = (
+                f"{TCM_IDENTITY_PROMPT}\n{patient_context}\n"
+                f"{audio_assistant_prompt}\n{language_instruction}"
+            )
             audio_prompt, sr = librosa.load(ref_path, sr=16000, mono=True)
-            sys_msg = {'role': 'user', 'content': [audio_voice_clone_prompt + "\n", audio_prompt, "\n" + audio_assistant_prompt]}
+            sys_msg = {'role': 'system', 'content': [audio_voice_clone_prompt + "\n", audio_prompt, "\n" + audio_assistant_prompt]}
         elif msg_type == 2: #video
-            voice_clone_prompt="你是一个AI助手。你能接受视频，音频和文本输入并输出语音和文本。模仿输入音频中的声音特征。"
+            voice_clone_prompt=CHINESE_VOICE_PROMPT
             assistant_prompt=tcm_assistant_prompt
             ref_path = self.ref_path_video_default
             
             if self.customized_options is not None:
-                voice_clone_prompt = self.customized_options['voice_clone_prompt']
-                assistant_prompt = self.customized_options['assistant_prompt']
+                assistant_prompt = self.customized_options.get('assistant_prompt') or tcm_assistant_prompt
                 
-            assistant_prompt = f"{TCM_IDENTITY_PROMPT}\n{assistant_prompt}"
+            assistant_prompt = (
+                f"{TCM_IDENTITY_PROMPT}\n{patient_context}\n"
+                f"{assistant_prompt}\n{language_instruction}"
+            )
             audio_prompt, sr = librosa.load(ref_path, sr=16000, mono=True)
-            sys_msg = {'role': 'user', 'content': [voice_clone_prompt, audio_prompt, assistant_prompt]}
+            sys_msg = {'role': 'system', 'content': [voice_clone_prompt, audio_prompt, assistant_prompt]}
         # elif msg_type == 3: #user start
         #     assistant_prompt="作为助手，你将使用这种声音风格说话。"
         #     if self.customized_options is not None:
@@ -305,14 +320,11 @@ class StreamManager:
         
         self.msg_type = msg_type
         msgs = [sys_msg]
-        if self.customized_options is not None:
-            if self.customized_options['use_audio_prompt'] > 0:
-                self.minicpmo_model.streaming_prefill(
-                    session_id=str(self.session_id),
-                    msgs=msgs,
-                    tokenizer=self.minicpmo_tokenizer,
-                )
-        if msg_type == 0:
+        use_audio_prompt = (
+            self.customized_options is None
+            or self.customized_options.get('use_audio_prompt', 1) > 0
+        )
+        if msg_type in (0, 2) or use_audio_prompt:
             self.minicpmo_model.streaming_prefill(
                 session_id=str(self.session_id),
                 msgs=msgs,

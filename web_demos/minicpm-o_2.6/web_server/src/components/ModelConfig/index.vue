@@ -38,6 +38,36 @@
             </div>
         </div>
         <div class="config-item">
+            <div class="config-item-label">患者性别：</div>
+            <div class="config-item-content">
+                <el-select v-model="configData.patientGender" placeholder="请选择" :disabled="isCalling">
+                    <el-option value="男" label="男" />
+                    <el-option value="女" label="女" />
+                    <el-option value="未知" label="未知" />
+                </el-select>
+            </div>
+        </div>
+        <div class="config-item">
+            <div class="config-item-label">患者年龄：</div>
+            <div class="config-item-content">
+                <el-input-number
+                    v-model="configData.patientAge"
+                    :min="0"
+                    :max="150"
+                    :disabled="isCalling"
+                />
+            </div>
+        </div>
+        <div class="config-item">
+            <div class="config-item-label">就诊类型：</div>
+            <div class="config-item-content">
+                <el-select v-model="configData.visitType" placeholder="请选择" :disabled="isCalling">
+                    <el-option value="初诊" label="初诊" />
+                    <el-option value="复诊" label="复诊" />
+                </el-select>
+            </div>
+        </div>
+        <div class="config-item">
             <div class="config-item-label">
                 <span>{{ t('vadThresholdBtn') }}</span>
                 <el-tooltip class="box-item" effect="dark" :content="t('vadThresholdTips')" placement="top">
@@ -173,6 +203,9 @@
     const configData = ref({
         canStopByVoice: false,
         videoQuality: false,
+        patientGender: '未知',
+        patientAge: null,
+        visitType: '初诊',
         useAudioPrompt: 1,
         vadThreshold: 0.8,
         voiceClonePrompt: defaultVoiceClonePrompt,
@@ -193,7 +226,7 @@
     //             defaultAssistantPrompt = '作为助手，你将使用这种声音风格说话。';
     //         } else {
     //             defaultVoiceClonePrompt = '克隆音频提示中的音色以生成语音。';
-    //             defaultAssistantPrompt = 'Your task is to be a helpful assistant using this voice pattern.';
+    //             defaultAssistantPrompt = '请始终使用简体中文，并使用这种声音风格提供帮助。';
     //         }
     //         configData.value.voiceClonePrompt = defaultVoiceClonePrompt;
     //         configData.value.assistantPrompt = defaultAssistantPrompt;
@@ -210,10 +243,9 @@
             } else if (newLocale === 'zh' && type.value === 'voice') {
                 defaultAssistantPrompt =
                     '你是中医问诊助手，负责在初诊和复诊场景中进行真实、谨慎、连续的病情采集。你需要围绕主诉、现病史、既往史、过敏史、当前用药和外用药反应、饮食、睡眠、二便、寒热汗出、口渴口苦、疼痛性质、情绪压力、女性月经/孕产情况等逐步追问。如果用户提供舌面、面部、患处或其他图片/视频，应结合可见信息提出后续问诊问题，但不要仅凭图片下最终诊断。你的回答要像线上问诊医生一样简洁自然，一次优先问1到3个关键问题，避免长篇科普。不要替代医生做最终诊断、不要直接开处方或承诺疗效；涉及急症、严重过敏、持续高热、胸痛、呼吸困难、意识异常、孕产妇/儿童高风险情况时，应建议及时线下就医。';
-            } else if (newLocale === 'en' && type.value === 'video') {
-                defaultAssistantPrompt = 'As an assistant, you will speak using this voice style.';
             } else {
-                defaultAssistantPrompt = 'As an assistant, you will speak using this voice style.';
+                defaultAssistantPrompt =
+                    '你是中医问诊助手，请始终使用简体中文，结合患者基本信息进行简洁、谨慎、连续的问诊。';
             }
             configData.value.assistantPrompt = defaultAssistantPrompt;
         },
@@ -242,7 +274,7 @@
             configData.value.timbre = [2];
             handleUpload();
         } else {
-            ElMessage.error('Please upload audio file and size not exceed 10MB');
+            ElMessage.error('请上传不超过 10MB 的音频文件');
         }
     };
     const isAudio = file => {
