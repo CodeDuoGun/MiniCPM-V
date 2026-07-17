@@ -41,7 +41,10 @@ def main() -> None:
                 errors.append(f"duplicate id: {sid}")
             ids.add(sid)
             conversations = sample.get("conversations", [])
-            if [m.get("role") for m in conversations] != ["user", "assistant"]:
+            task = sample.get("metadata", {}).get("task")
+            roles = [m.get("role") for m in conversations]
+            expected_roles = ["user" if index % 2 == 0 else "assistant" for index in range(len(roles))]
+            if len(roles) < 2 or roles != expected_roles or roles[-1] != "assistant":
                 errors.append(f"{sid}: invalid roles")
             image_value = sample.get("image")
             if isinstance(image_value, str):
@@ -50,6 +53,9 @@ def main() -> None:
             elif isinstance(image_value, dict):
                 image_paths = list(image_value.values())
                 expected_placeholders = set(image_value)
+            elif image_value is None and task == "realtime_text_consultation":
+                image_paths = []
+                expected_placeholders = set()
             else:
                 image_paths = []
                 expected_placeholders = set()
@@ -67,20 +73,33 @@ def main() -> None:
             if PII_RE.search(blob):
                 errors.append(f"{sid}: possible direct identifier")
             answer = conversations[-1].get("content", "") if conversations else ""
+            assistant_blob = "\n".join(
+                message.get("content", "") for message in conversations if message.get("role") == "assistant"
+            )
+            if "意图" in assistant_blob:
+                errors.append(f"{sid}: assistant contains intent annotation")
             if dataset_kind == "realtime":
                 if "实时视频严禁读取" not in user_content or "手动上传入口" not in user_content:
                     errors.append(f"{sid}: missing realtime report prohibition")
+                visit_type = sample.get("metadata", {}).get("visit_type")
+                expected_visit_policy = "这是复诊" if visit_type == "复诊" else "这是初诊"
+                if expected_visit_policy not in user_content:
+                    errors.append(f"{sid}: missing differentiated visit policy")
+                dialogue_source = sample.get("metadata", {}).get("dialogue_source", "")
+                if not dialogue_source.endswith("outputs/medical_sft_minicpmo/tcm_consult_minicpmo.json"):
+                    errors.append(f"{sid}: wrong dialogue source")
             elif "手动上传入口" not in user_content or "不是实时视频帧" not in user_content:
                 errors.append(f"{sid}: missing explicit manual-upload provenance")
-            if UNSAFE_RE.search(answer):
+            if UNSAFE_RE.search(assistant_blob):
                 errors.append(f"{sid}: unsafe diagnosis/prescription-like wording")
-            if "急诊" not in answer:
+            if "急诊" not in blob:
                 errors.append(f"{sid}: missing escalation wording")
-            if not any(
-                wording in answer
-                for wording in ("不能仅凭图片", "不能据此确诊", "不能单独用于确诊", "不应因继续拍摄或分析")
-            ):
-                errors.append(f"{sid}: missing image limitation wording")
+            if task != "realtime_text_consultation":
+                if not any(
+                    wording in assistant_blob
+                    for wording in ("不能仅凭图片", "不能据此确诊", "不能单独用于确诊", "不应因继续拍摄或分析")
+                ):
+                    errors.append(f"{sid}: missing image limitation wording")
             for rel in image_paths:
                 image_count += 1
                 images_by_split[split].add(str(rel))

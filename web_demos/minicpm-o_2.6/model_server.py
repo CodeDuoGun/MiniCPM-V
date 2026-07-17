@@ -776,6 +776,11 @@ class StreamManager:
                             session_id=str(self.session_id),
                             tokenizer=self.minicpmo_tokenizer,
                             generate_audio=True,
+                            use_tts_template=True,
+                            enable_thinking=False,
+                            do_sample=True,
+                            max_new_tokens=512,
+                            length_penalty=1.1, # 对实时语音对话模式，建议 length_penalty=1.1 以提升回复内容质量
                             # enable_regenerate=True,
                         ):
                             if self.stop_response:

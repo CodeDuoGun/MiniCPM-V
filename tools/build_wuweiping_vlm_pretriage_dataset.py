@@ -42,9 +42,8 @@ DEFAULT_RECORDS = Path(
     "wuweiping_record_20260525.json"
 )
 DEFAULT_DIALOGUES = Path(
-    "/Users/tangxueduo/Projects/LLaMA-Factory/medical/processed_data/wuweiping/"
-    "wuweiping_postasr_speaker_content.json"
-)
+    __file__
+).resolve().parents[1] / "outputs/medical_sft_minicpmo/tcm_consult_minicpmo.json"
 DEFAULT_MEDICAL_ROOT = Path("/Users/tangxueduo/Projects/LLaMA-Factory")
 DEFAULT_OUTPUT = Path("data/wuweiping_vlm_pretriage")
 
@@ -72,9 +71,34 @@ DIAGNOSIS_PHRASE_RE = re.compile(
     r"(?:考虑|诊断为|确诊为|提示为|符合)\s*[^，。；\n]{1,40}"
 )
 DIRECT_NUMBER_RE = re.compile(r"(?<!\d)(?:1\d{10}|\d{17}[\dXx]|\d{15})(?!\d)")
+INTENT_TAG_RE = re.compile(
+    r"(?:\[\s*意图\s*[:：]?[^\]\n]*\]|【\s*意图[^】\n]*】|(?<!\[)意图\s*[:：][^\]\n]*\])"
+)
 NON_REPORT_DOCUMENT_RE = re.compile(
     r"处方|诊断|主诉|现病史|体格检查|病历(?:号)?|就诊号|住院号|处方号|"
     r"药品(?:名称)?|用法|用量|嘱托|治疗(?:方案|记录)?|科室"
+)
+UNSAFE_DOCTOR_TURN_RE = re.compile(
+    r"确诊|诊断为|考虑为|辨证为|处方|开药|服用|口服|外用|每日\d|一天\d|"
+    r"治疗方案|疗程|加减方|剂量|mg|毫克|克/次"
+)
+QUESTION_LIKE_RE = re.compile(
+    r"[？?]|吗|呢|么|是否|有没有|有无|多久|什么时候|从什么时候|什么原因|"
+    r"哪里|哪边|哪个部位|怎样|怎么样|如何|几岁|多大|体重|严重|程度|"
+    r"加重|减轻|缓解|反复|复发|变化|伴随|痒|疼|痛|烫|渗|肿|破溃|"
+    r"过敏|既往|家族|用药|药物|效果|不适|睡眠|饮食|食欲|大便|小便|"
+    r"月经|怀孕|备孕|哺乳|检查|报告|看下|看一下|伸舌|拍.*(?:舌|患处|皮损)"
+)
+
+FIRST_VISIT_POLICY = (
+    "这是初诊。先建立主诉，再按起病时间与诱因、部位、性质和严重度、变化趋势、伴随症状、"
+    "既往诊疗与效果、过敏史、既往史、当前用药、家族史和必要的生活/生育信息逐步追问；"
+    "优先排除危险信号，未知信息要继续确认，信息足够后总结并请患者核对。"
+)
+FOLLOWUP_VISIT_POLICY = (
+    "这是复诊。先比较上次就诊后的症状变化，再询问治疗执行情况、疗效和不良反应、是否出现新症状或危险信号、"
+    "复查指标以及用药/过敏/孕哺等关键信息变化；不要机械重复已经明确且没有变化的完整既往史，"
+    "信息足够后总结本次变化并请患者核对。"
 )
 SYMPTOMS = (
     "潮红", "红斑", "丘疹", "脓疱", "脓包", "结节", "瘙痒", "发痒", "发烫", "灼热",
@@ -142,10 +166,66 @@ def write_json(path: Path, value: Any) -> None:
 
 
 def clean_text(value: Any, limit: int = 240) -> str:
-    result = DIRECT_ID_RE.sub("[已脱敏]", str(value or ""))
+    result = INTENT_TAG_RE.sub("", str(value or ""))
+    result = DIRECT_ID_RE.sub("[已脱敏]", result)
     result = DIAGNOSIS_PHRASE_RE.sub("", result)
     result = re.sub(r"\s+", " ", result).strip(" ，,。；;")
     return result[:limit]
+
+
+def dialogue_pairs(raw_dialogue: Any) -> list[dict[str, str]]:
+    """Extract safe doctor-question/patient-answer pairs from an encounter."""
+
+    if not isinstance(raw_dialogue, list):
+        return []
+    pairs: list[dict[str, str]] = []
+    for index, turn in enumerate(raw_dialogue[:-1]):
+        if not isinstance(turn, dict) or turn.get("speaker") != "医生":
+            continue
+        next_turn = raw_dialogue[index + 1]
+        if not isinstance(next_turn, dict) or next_turn.get("speaker") not in {"患者", "病人", "用户", "家属"}:
+            continue
+        question = clean_text(turn.get("content"), 240)
+        answer = clean_text(next_turn.get("content"), 320)
+        if not question or not answer:
+            continue
+        if UNSAFE_DOCTOR_TURN_RE.search(question) or not QUESTION_LIKE_RE.search(question):
+            continue
+        pairs.append({"question": question, "answer": answer})
+    return pairs
+
+
+def minicpmo_dialogue_pairs(sample: dict[str, Any]) -> list[dict[str, str]]:
+    """Extract next-question supervision from the designated MiniCPM dataset."""
+
+    conversations = sample.get("conversations") or []
+    pairs: list[dict[str, str]] = []
+    for index, message in enumerate(conversations):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        question = clean_text(message.get("content"), 240)
+        if not question or INTENT_TAG_RE.search(question):
+            continue
+        if UNSAFE_DOCTOR_TURN_RE.search(question) or not QUESTION_LIKE_RE.search(question):
+            continue
+        answer = ""
+        if index + 1 < len(conversations) and conversations[index + 1].get("role") == "user":
+            answer = clean_text(conversations[index + 1].get("content"), 320)
+        # A final unanswered doctor question is still a valid next-question target.
+        if answer or index == len(conversations) - 1:
+            pairs.append({"question": question, "answer": answer})
+    return pairs
+
+
+def minicpmo_visit_type(sample: dict[str, Any]) -> str:
+    conversations = sample.get("conversations") or []
+    first_content = conversations[0].get("content", "") if conversations else ""
+    match = re.search(r"就诊类型\s*[:：]\s*(初诊|复诊)", first_content)
+    return match.group(1) if match else ""
+
+
+def visit_policy(record: dict[str, Any]) -> str:
+    return FOLLOWUP_VISIT_POLICY if record.get("is_first") == "复诊" else FIRST_VISIT_POLICY
 
 
 def symptom_summary(value: Any) -> str:
@@ -362,7 +442,17 @@ def normalize_analysis(raw: dict[str, Any], entry: dict[str, Any]) -> dict[str, 
 def command_prepare(args: argparse.Namespace) -> None:
     records = read_json(args.records)
     dialogues = read_json(args.dialogues)
-    matched_ids = {str(item.get("record_id")) for item in dialogues}
+    best_dialogues: dict[str, dict[str, Any]] = {}
+    for item in dialogues:
+        rid = str(item.get("id"))
+        pairs = minicpmo_dialogue_pairs(item)
+        current_pairs = best_dialogues.get(rid, {}).get("pairs", [])
+        if len(pairs) > len(current_pairs):
+            best_dialogues[rid] = {
+                "pairs": pairs,
+                "visit_type": minicpmo_visit_type(item),
+            }
+    matched_ids = set(best_dialogues)
     entries: dict[tuple[str, str], dict[str, Any]] = {}
     record_rows = []
     for record in records:
@@ -375,8 +465,10 @@ def command_prepare(args: argparse.Namespace) -> None:
                 "patient_key": str(record.get("patient_id") or record.get("user_info_id") or rid),
                 "sex": clean_text(record.get("patient_sex"), 4),
                 "age": safe_age(record.get("patient_age")),
-                "is_first": clean_text(record.get("is_first"), 8),
+                "is_first": best_dialogues.get(rid, {}).get("visit_type") or clean_text(record.get("is_first"), 8),
                 "symptoms": symptom_summary(record.get("doc_ass_stu_appeal") or record.get("patient_appeal")),
+                "dialogue_pairs": best_dialogues.get(rid, {}).get("pairs", []),
+                "dialogue_source": str(args.dialogues.resolve()),
             }
         )
         for field in ("tongue_face_img", "admin_report_img"):
@@ -410,7 +502,14 @@ def command_prepare(args: argparse.Namespace) -> None:
         for item in manifest:
             handle.write(f'url = "{item["url"]}"\noutput = "{item["local_path"]}"\n')
     stats = Counter(item["source_field"] for item in manifest)
-    print(json.dumps({"records": len(record_rows), "unique_images": len(manifest), "by_field": stats}, ensure_ascii=False, default=dict, indent=2))
+    print(json.dumps({
+        "records": len(record_rows),
+        "dialogue_source": str(args.dialogues),
+        "records_with_dialogue_pairs": sum(bool(item["dialogue_pairs"]) for item in record_rows),
+        "dialogue_pairs": sum(len(item["dialogue_pairs"]) for item in record_rows),
+        "unique_images": len(manifest),
+        "by_field": stats,
+    }, ensure_ascii=False, default=dict, indent=2))
 
 
 def command_download(args: argparse.Namespace) -> None:
@@ -667,29 +766,118 @@ def is_supported_uploaded_report(analysis: dict[str, Any]) -> bool:
     return True
 
 
+def clinical_observation(analyses: list[dict[str, Any]]) -> str:
+    descriptions = [
+        f"图{index + 1}：{clean_text(item.get('description'), 140)}"
+        for index, item in enumerate(analyses)
+    ]
+    return (
+        "我先做客观记录："
+        + "；".join(descriptions)
+        + "。图片受光线、角度和清晰度影响，不能据此确诊。"
+    )
+
+
+def realtime_multiturn_conversations(
+    user_prompt: str,
+    analyses: list[dict[str, Any]],
+    record: dict[str, Any],
+    max_dialogue_pairs: int,
+) -> tuple[list[dict[str, str]], int]:
+    pairs = list(record.get("dialogue_pairs") or [])[:max_dialogue_pairs]
+    if not pairs:
+        return [
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": clinical_answer(analyses, record)},
+        ], 0
+
+    conversations = [
+        {"role": "user", "content": user_prompt},
+        {
+            "role": "assistant",
+            "content": clinical_observation(analyses) + "\n" + pairs[0]["question"],
+        },
+    ]
+    # End on a doctor question so every patient answer supervises the next ask.
+    for index in range(len(pairs) - 1):
+        conversations.append({"role": "user", "content": pairs[index]["answer"]})
+        conversations.append({"role": "assistant", "content": pairs[index + 1]["question"]})
+    return conversations, len(pairs)
+
+
+def text_dialogue_sample(record: dict[str, Any], max_dialogue_pairs: int) -> dict[str, Any] | None:
+    pairs = list(record.get("dialogue_pairs") or [])[:max_dialogue_pairs]
+    if not pairs:
+        return None
+    user_prompt = (
+        f"任务要求：{REALTIME_SYSTEM_POLICY}\n"
+        f"问诊策略：{visit_policy(record)}\n"
+        "当前没有可用的舌象或患处图片，请仅根据患者已经回答的内容逐步追问；一次优先询问1至3个关键问题。\n"
+        f"{profile_text(record)}"
+    )
+    conversations = [
+        {"role": "user", "content": user_prompt},
+        {"role": "assistant", "content": pairs[0]["question"]},
+    ]
+    for index in range(len(pairs) - 1):
+        conversations.append({"role": "user", "content": pairs[index]["answer"]})
+        conversations.append({"role": "assistant", "content": pairs[index + 1]["question"]})
+    visit_type = record.get("is_first") or "未知"
+    return {
+        "id": hash_id(f"{record['record_id']}:text-dialogue:{visit_type}", 16),
+        "conversations": conversations,
+        "metadata": {
+            "visit_type": visit_type,
+            "dialogue_pairs": len(pairs),
+            "task": "realtime_text_consultation",
+            "dialogue_source": record.get("dialogue_source"),
+        },
+        "_category": "dialogue_followup" if visit_type == "复诊" else "dialogue_initial",
+        "_patient_key": record["patient_key"],
+    }
+
+
 def make_sample(
-    record: dict[str, Any], entries: list[dict[str, Any]], analyses: list[dict[str, Any]], paths: list[Path], category: str
+    record: dict[str, Any],
+    entries: list[dict[str, Any]],
+    analyses: list[dict[str, Any]],
+    paths: list[Path],
+    category: str,
+    max_dialogue_pairs: int,
 ) -> dict[str, Any]:
     image, placeholders = native_image_value(paths)
     if category.startswith("clinical"):
         user = (
             f"{placeholders}\n任务要求：{REALTIME_SYSTEM_POLICY}\n"
+            f"问诊策略：{visit_policy(record)}\n"
             f"以上为实时音视频会话采集的舌面/面部/患处画面。请逐图客观记录，并继续收集预问诊信息。\n"
             f"{profile_text(record)}"
         )
-        answer = clinical_answer(analyses, record)
+        conversations, used_dialogue_pairs = realtime_multiturn_conversations(
+            user, analyses, record, max_dialogue_pairs
+        )
     else:
         user = (
             f"{placeholders}\n任务要求：{REPORT_UPLOAD_SYSTEM_POLICY}\n"
             f"以上检查报告由用户通过独立的检查报告手动上传入口提交，不是实时视频帧。"
             f"请读取可见项目并继续收集必要病史。\n{profile_text(record)}"
         )
-        answer = report_answer(analyses, record)
+        conversations = [
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": report_answer(analyses, record)},
+        ]
+        used_dialogue_pairs = 0
     signature = ":".join(entry["image_id"] for entry in entries)
     return {
         "id": hash_id(f"{record['record_id']}:{category}:{signature}", 16),
         "image": image,
-        "conversations": [{"role": "user", "content": user}, {"role": "assistant", "content": answer}],
+        "conversations": conversations,
+        "metadata": {
+            "visit_type": record.get("is_first") or "未知",
+            "dialogue_pairs": used_dialogue_pairs,
+            "task": "realtime_visual_consultation" if category.startswith("clinical") else "manual_report_upload",
+            "dialogue_source": record.get("dialogue_source") if category.startswith("clinical") else None,
+        },
         "_category": category,
         "_patient_key": record["patient_key"],
     }
@@ -723,13 +911,16 @@ def add_red_flag_samples(samples: list[dict[str, Any]], limit: int) -> list[dict
         copy = dict(base)
         copy["id"] = hash_id(f"{base['id']}:redflag:{index}", 16)
         copy["_category"] = "safety_red_flag"
-        copy["conversations"] = [dict(turn) for turn in base["conversations"]]
+        copy["conversations"] = [dict(turn) for turn in base["conversations"][:2]]
         copy["conversations"][0]["content"] += "\n补充情况：" + scenario
         copy["conversations"][1]["content"] = (
             f"你补充的“{signal}”属于需要立即处理的危险信号。请停止等待线上回复，立即前往急诊或呼叫120，"
             "不要自行驾车；若身边有人，请让其陪同并携带现有用药和过敏信息。此时不应因继续拍摄或分析图片"
             "而延误急救，我也不能在线确诊或开处方。"
         )
+        copy["metadata"] = dict(base.get("metadata") or {})
+        copy["metadata"]["dialogue_pairs"] = 0
+        copy["metadata"]["safety_augmentation"] = "red_flag"
         additions.append(copy)
     return samples + additions
 
@@ -775,22 +966,26 @@ def command_build(args: argparse.Namespace) -> None:
         reports = sorted(report_by_record.get(rid, []), key=lambda item: item[0]["image_id"])
         component = components.get(record["patient_key"], record["patient_key"])
         split = split_name(component, args.seed)
+        dialogue_sample = text_dialogue_sample(record, args.max_dialogue_pairs)
+        if dialogue_sample is not None:
+            realtime_candidates[split].append(dialogue_sample)
         for item in clinical:
-            realtime_candidates[split].append(make_sample(record, [item[0]], [item[1]], [item[2]], "clinical_single"))
+            realtime_candidates[split].append(make_sample(record, [item[0]], [item[1]], [item[2]], "clinical_single", args.max_dialogue_pairs))
         for group in chunks(clinical, args.max_clinical_group):
             if len(group) > 1:
-                realtime_candidates[split].append(make_sample(record, [x[0] for x in group], [x[1] for x in group], [x[2] for x in group], "clinical_group"))
+                realtime_candidates[split].append(make_sample(record, [x[0] for x in group], [x[1] for x in group], [x[2] for x in group], "clinical_group", args.max_dialogue_pairs))
         for item in reports:
-            report_upload_candidates[split].append(make_sample(record, [item[0]], [item[1]], [item[2]], "report_upload_single"))
+            report_upload_candidates[split].append(make_sample(record, [item[0]], [item[1]], [item[2]], "report_upload_single", args.max_dialogue_pairs))
         for group in chunks(reports, args.max_report_group):
             if len(group) > 1:
-                report_upload_candidates[split].append(make_sample(record, [x[0] for x in group], [x[1] for x in group], [x[2] for x in group], "report_upload_group"))
+                report_upload_candidates[split].append(make_sample(record, [x[0] for x in group], [x[1] for x in group], [x[2] for x in group], "report_upload_group", args.max_dialogue_pairs))
 
     stats: dict[str, Any] = {
         "manifest_images": len(manifest),
-        "analyzed_images": len(analyses),
+        "analyzed_images": sum(image_id in analyses for image_id in entries),
+        "orphaned_cached_analyses": sum(image_id not in entries for image_id in analyses),
         "verified_report_images": sum(item.get("pii_clear") is True for item in verification.values()),
-        "build_is_partial": len(analyses) < len(manifest),
+        "build_is_partial": any(image_id not in analyses for image_id in entries),
         "allow_unverified_reports": args.allow_unverified_reports,
         "dataset_policy": {
             "realtime": "clinical images only; report/document OCR is prohibited",
@@ -813,6 +1008,9 @@ def command_build(args: argparse.Namespace) -> None:
             "candidate_count": len(values),
             "selected_count": len(public),
             "categories": dict(category_counts),
+            "visit_types": dict(Counter(item.get("metadata", {}).get("visit_type", "未知") for item in public)),
+            "multiturn_samples": sum(len(item.get("conversations", [])) > 2 for item in public),
+            "dialogue_pairs": sum(item.get("metadata", {}).get("dialogue_pairs", 0) for item in public),
         }
     for split, values in report_upload_candidates.items():
         selected = shuffled(values, f"{args.seed}:report-upload:{split}")
@@ -862,6 +1060,7 @@ def parse_args() -> argparse.Namespace:
     build.add_argument("--seed", default="20260715")
     build.add_argument("--max-clinical-group", type=int, default=4)
     build.add_argument("--max-report-group", type=int, default=4)
+    build.add_argument("--max-dialogue-pairs", type=int, default=12, help="每个实时样本最多保留多少组医生问题/患者回答")
     build.add_argument("--allow-unverified-reports", action="store_true", help="仅限开发；生产数据不应使用")
     build.add_argument("--red-flag-samples", type=int, default=50)
     return parser.parse_args()
