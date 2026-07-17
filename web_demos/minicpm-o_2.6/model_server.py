@@ -9,6 +9,8 @@ import aiofiles
 import librosa
 import soundfile
 import wave
+import urllib.error
+import urllib.request
 from typing import Dict, List, Any, Optional
 import argparse
 import logging
@@ -61,8 +63,9 @@ ap = argparse.ArgumentParser()
 ap.add_argument('--port', type=int , default=32550)
 ap.add_argument('--model', type=str , default="openbmb/MiniCPM-o-2_6", help="huggingface model name or local path")
 ap.add_argument('--adapter', type=str, default="", help="optional LoRA adapter path")
-ap.add_argument('--merge-lora', action='store_true', default=True, help="merge LoRA adapter into the base model for inference")
+ap.add_argument('--merge-lora', action=argparse.BooleanOptionalAction, default=True, help="merge LoRA adapter into the base model for inference")
 ap.add_argument('--system-prompt', type=str, default="", help="assistant system prompt used for the realtime session")
+ap.add_argument('--human-service-url', type=str, default="http://127.0.0.1:8010/aihuman", help="Wav2Lip digital-human service API base URL")
 args = ap.parse_args()
 
 TCM_SYSTEM_PROMPT = (
@@ -73,6 +76,14 @@ TCM_SYSTEM_PROMPT = (
     "你的回答要像线上问诊医生一样简洁自然，一次优先问1到3个关键问题，避免长篇科普。"
     "不要替代医生做最终诊断、不要直接开处方或承诺疗效；涉及急症、严重过敏、持续高热、胸痛、呼吸困难、意识异常、"
     "孕产妇/儿童高风险情况时，应建议及时线下就医。"
+)
+
+TCM_IDENTITY_PROMPT = (
+    "你的固定身份是吴卫平医生的数字助手。"
+    "当用户询问‘你是谁’、‘你是什么模型’、‘你来自哪里’或类似身份问题时，"
+    "应明确回答：‘我是吴卫平医生的数字助手。’"
+    "不要自称面壁智能、MiniCPM、语言模型、大模型或其他公司/产品的助手，"
+    "也不要主动讨论底层模型、训练机构或技术实现。"
 )
 
 
@@ -116,11 +127,20 @@ class StreamManager:
                 if PeftModel is None:
                     raise ImportError("peft is required when --adapter is provided. Please install peft first.")
                 logger.info(f"Loading LoRA adapter from {args.adapter}")
-                self.minicpmo_model = PeftModel.from_pretrained(
-                    self.minicpmo_model,
-                    args.adapter,
-                    torch_dtype=self.target_dtype,
-                )
+                try:
+                    self.minicpmo_model = PeftModel.from_pretrained(
+                        self.minicpmo_model,
+                        args.adapter,
+                        torch_dtype=self.target_dtype,
+                        torch_device="cpu",
+                        low_cpu_mem_usage=True,
+                    )
+                except TypeError:
+                    self.minicpmo_model = PeftModel.from_pretrained(
+                        self.minicpmo_model,
+                        args.adapter,
+                        torch_dtype=self.target_dtype,
+                    )
                 if args.merge_lora:
                     logger.info("Merging LoRA adapter for inference")
                     self.minicpmo_model = self.minicpmo_model.merge_and_unload()
@@ -129,7 +149,9 @@ class StreamManager:
         # self.minicpmo_model.tts.float()
         self.minicpmo_model.to(self.device).eval()
 
-        self.ref_path_video_default = "assets/ref_audios/video_default.wav"
+        self.ref_path_video_default = os.path.abspath(
+            os.path.join(cur_path, "../../data/Wuweiping_test3_处理后音频.m4a")
+        )
         self.ref_path_default = "assets/ref_audios/default.wav"
         self.ref_path_female = "assets/ref_audios/female_example.wav"
         self.ref_path_male = "assets/ref_audios/male_example.wav"
@@ -147,6 +169,9 @@ class StreamManager:
         self.vad_time = 0
         self.ls_time = 0
         self.msg_type = 1
+        self.digital_human_session_id = None
+        self.digital_human_msg_id = None
+        self.digital_human_segment_index = 0
         
         self.speaking_time_stamp = 0
         self.cycle_wait_time = 12800/24000 + 0.15
@@ -256,6 +281,7 @@ class StreamManager:
                 elif self.customized_options['use_audio_prompt'] == 3:
                     ref_path = self.ref_path_male
 
+            audio_assistant_prompt = f"{TCM_IDENTITY_PROMPT}\n{audio_assistant_prompt}"
             audio_prompt, sr = librosa.load(ref_path, sr=16000, mono=True)
             sys_msg = {'role': 'user', 'content': [audio_voice_clone_prompt + "\n", audio_prompt, "\n" + audio_assistant_prompt]}
         elif msg_type == 2: #video
@@ -266,13 +292,8 @@ class StreamManager:
             if self.customized_options is not None:
                 voice_clone_prompt = self.customized_options['voice_clone_prompt']
                 assistant_prompt = self.customized_options['assistant_prompt']
-                if self.customized_options['use_audio_prompt'] == 1:
-                    ref_path = self.ref_path_default
-                elif self.customized_options['use_audio_prompt'] == 2:
-                    ref_path = self.ref_path_female
-                elif self.customized_options['use_audio_prompt'] == 3:
-                    ref_path = self.ref_path_male
                 
+            assistant_prompt = f"{TCM_IDENTITY_PROMPT}\n{assistant_prompt}"
             audio_prompt, sr = librosa.load(ref_path, sr=16000, mono=True)
             sys_msg = {'role': 'user', 'content': [voice_clone_prompt, audio_prompt, assistant_prompt]}
         # elif msg_type == 3: #user start
@@ -536,7 +557,7 @@ class StreamManager:
                         audio_stream = wav_file.read()
                 except FileNotFoundError:
                     print(f"File {input_audio_path} not found.")
-                yield base64.b64encode(audio_stream).decode('utf-8'), "assistant:\n"
+                yield base64.b64encode(audio_stream).decode('utf-8'), "assistant:\n", None
                 
                 print('=== gen start: ', time.time() - time_gen)
                 first_time = True
@@ -574,11 +595,33 @@ class StreamManager:
                                 print(f"File {output_audio_path} not found.")
                             temp_time1 = time.time()
                             print('text: ', text)
-                            yield base64.b64encode(audio_stream).decode('utf-8'), text
+                            human_delivered = None
+                            if self.digital_human_session_id:
+                                segment_index = self.digital_human_segment_index
+                                self.digital_human_segment_index += 1
+                                segment_id = f"{self.digital_human_msg_id}_{segment_index}"
+                                try:
+                                    await post_human_service(
+                                        "/external_audio",
+                                        {
+                                            "audio_source": "minicpm_o_tts",
+                                            "session_id": self.digital_human_session_id,
+                                            "msg_id": self.digital_human_msg_id,
+                                            "segment_id": segment_id,
+                                            "segment_index": segment_index,
+                                            "text": text,
+                                            "audio": base64.b64encode(audio_stream).decode('utf-8'),
+                                        },
+                                    )
+                                    human_delivered = True
+                                except Exception as exc:
+                                    logger.error(f"digital human audio forwarding failed: {exc}")
+                                    human_delivered = False
+                            yield base64.b64encode(audio_stream).decode('utf-8'), text, human_delivered
                             self.speaking_time_stamp += self.cycle_wait_time
                     except Exception as e:
                         logger.error(f"Error happened during generation: {str(e)}")
-                    yield None, '\n<end>'
+                    yield None, '\n<end>', None
 
         except Exception as e:
             logger.error(f"发生异常:{e}")
@@ -630,6 +673,27 @@ class StreamManager:
 
 
 stream_manager = StreamManager()
+
+
+async def post_human_service(path: str, payload: dict) -> dict:
+    url = f"{args.human_service_url.rstrip('/')}{path}"
+
+    def _post():
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"human service returned {exc.code}: {detail}") from exc
+
+    return await asyncio.to_thread(_post)
 
 
 @app.on_event("startup")
@@ -779,7 +843,7 @@ async def generate_sse_response(request: Request, uid: Optional[str] = Header(No
         # Generate response
         try:
             yield f"event: message\n"
-            async for audio, text in stream_manager.generate():
+            async for audio, text, human_delivered in stream_manager.generate():
                 if text == "stop":
                     break
                 res = {
@@ -790,6 +854,7 @@ async def generate_sse_response(request: Request, uid: Optional[str] = Header(No
                             "role": "assistant",
                             "audio": audio,
                             "text": text,
+                            "digital_human_audio": human_delivered,
                             "finish_reason": "processing"
                         }
                     ]
@@ -831,6 +896,12 @@ async def completions(request: Request, uid: Optional[str] = Header(None)):
         stream_manager.start_conversation()
 
         data = await request.json()
+        human_session_id = data.get("digital_human_session_id")
+        stream_manager.digital_human_session_id = int(human_session_id) if human_session_id else None
+        stream_manager.digital_human_msg_id = str(
+            data.get("digital_human_msg_id") or f"minicpm_{stream_manager.session_id}_{int(time.time() * 1000)}"
+        )
+        stream_manager.digital_human_segment_index = 0
 
         return StreamingResponse(
             generate_sse_response(request, uid),
@@ -861,6 +932,17 @@ async def stop_response(request: Request, uid: Optional[str] = Header(None)):
     # stream_manager.session_id += 1
     logger.info(f"uid {uid}: received stop_response")
     stream_manager.stop_response = True
+    if stream_manager.digital_human_session_id:
+        try:
+            await post_human_service(
+                "/interrupt_talk",
+                {
+                    "session_id": stream_manager.digital_human_session_id,
+                    "msg_id": stream_manager.digital_human_msg_id or f"stop_{int(time.time() * 1000)}",
+                },
+            )
+        except Exception as exc:
+            logger.warning(f"digital human interrupt failed: {exc}")
     response = {
         "id": uid,
         "choices": {
@@ -870,6 +952,27 @@ async def stop_response(request: Request, uid: Optional[str] = Header(None)):
         }
     }
     return JSONResponse(content=response, status_code=200)
+
+
+@app.post("/api/v1/digital-human/offer")
+async def digital_human_offer(request: Request):
+    payload = await request.json()
+    payload["external_audio"] = True
+    try:
+        return JSONResponse(content=await post_human_service("/offer", payload), status_code=200)
+    except Exception as exc:
+        logger.error(f"digital human offer failed: {exc}")
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/v1/digital-human/close")
+async def digital_human_close(request: Request):
+    payload = await request.json()
+    try:
+        return JSONResponse(content=await post_human_service("/webrtc_graceful_close", payload), status_code=200)
+    except Exception as exc:
+        logger.warning(f"digital human close failed: {exc}")
+        return JSONResponse(content={"code": -1, "msg": str(exc)}, status_code=200)
 
 @app.post("/feedback")
 @app.post("/api/v1/feedback")

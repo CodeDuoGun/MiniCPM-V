@@ -18,16 +18,31 @@
                 />
             </div>
             <!-- <SelectTimbre v-model:timbre="timbre" v-model:audioData="audioData" v-model:disabled="isCalling" /> -->
+            <div class="digital-human-switch">
+                <span>数字人</span>
+                <el-switch v-model="digitalHumanEnabled" :disabled="isCalling" />
+            </div>
         </div>
         <div class="video-page-content">
-            <div class="video-page-content-video" v-loading="loading" element-loading-background="#f3f3f3">
+            <div class="video-page-content-video patient-panel" v-loading="loading" element-loading-background="#f3f3f3">
+                <div class="panel-title">患者</div>
                 <video ref="videoRef" autoplay playsinline muted />
                 <canvas ref="canvasRef" canvas-id="canvasId" style="display: none" />
                 <div class="switch-camera" v-if="isMobile()" @click="switchCamera">
                     <SvgIcon name="switch-camera" class="icon" />
                 </div>
             </div>
-            <div class="video-page-content-right">
+            <div
+                class="video-page-content-right avatar-panel"
+                :class="{ 'human-disabled': !digitalHumanEnabled }"
+            >
+                <div class="panel-title">{{ digitalHumanEnabled ? '数字人医生' : '问诊记录' }}</div>
+                <div v-if="digitalHumanEnabled" class="avatar-video-wrap">
+                    <video ref="avatarVideoRef" autoplay playsinline />
+                    <div v-if="!digitalHumanReady" class="avatar-state">
+                        {{ digitalHumanConnecting ? '数字人连接中…' : '数字人服务未连接' }}
+                    </div>
+                </div>
                 <div class="output-content">
                     <ModelOutput
                         v-if="outputData.length > 0"
@@ -81,6 +96,11 @@
     }); // 自定义音色base64
     const isCalling = defineModel();
     const videoRef = ref();
+    const avatarVideoRef = ref();
+    const digitalHumanEnabled = ref(false);
+    const digitalHumanReady = ref(false);
+    const digitalHumanConnecting = ref(false);
+    const digitalHumanSessionId = ref(null);
     const videoStream = ref(null);
     const interval = ref();
     const canvasRef = ref();
@@ -128,6 +148,8 @@
     let audioChunks = [];
     let count = 0;
     let audioDOM;
+    let digitalHumanPeer;
+    let digitalHumanStream;
 
     onBeforeUnmount(() => {
         stopRecording();
@@ -184,6 +206,10 @@
                 }
                 // 每次call都需要生成新uid
                 setNewUserId();
+                await initVideoStream('environment');
+                if (digitalHumanEnabled.value) {
+                    await initDigitalHuman();
+                }
                 buildConnect();
                 await delay(100);
                 // if (socket) {
@@ -193,8 +219,6 @@
                 //     `/ws/stream${window.location.search}&uid=${getNewUserId()}&service=minicpmo-server`
                 // );
                 // socket.connect();
-
-                initVideoStream('environment');
                 if (localStorage.getItem('canStopByVoice') === 'true') {
                     console.log('vad start');
                     vadStart();
@@ -274,6 +298,102 @@
                 processor.connect(audioContext.destination);
             } catch {}
         }
+    };
+    const waitForIceGathering = peer => {
+        if (peer.iceGatheringState === 'complete') return Promise.resolve();
+        return new Promise(resolve => {
+            const handler = () => {
+                if (peer.iceGatheringState === 'complete') {
+                    peer.removeEventListener('icegatheringstatechange', handler);
+                    resolve();
+                }
+            };
+            peer.addEventListener('icegatheringstatechange', handler);
+            setTimeout(resolve, 5000);
+        });
+    };
+    const waitForPeerConnected = peer => {
+        if (peer.connectionState === 'connected') return Promise.resolve();
+        return new Promise((resolve, reject) => {
+            const timeout = setTimeout(() => {
+                peer.removeEventListener('connectionstatechange', handler);
+                reject(new Error('数字人 WebRTC 连接超时'));
+            }, 8000);
+            const handler = () => {
+                if (peer.connectionState === 'connected') {
+                    clearTimeout(timeout);
+                    peer.removeEventListener('connectionstatechange', handler);
+                    resolve();
+                } else if (['failed', 'closed'].includes(peer.connectionState)) {
+                    clearTimeout(timeout);
+                    peer.removeEventListener('connectionstatechange', handler);
+                    reject(new Error(`数字人 WebRTC 状态异常: ${peer.connectionState}`));
+                }
+            };
+            peer.addEventListener('connectionstatechange', handler);
+        });
+    };
+    const initDigitalHuman = async () => {
+        if (!digitalHumanEnabled.value) return;
+        closeDigitalHuman();
+        digitalHumanConnecting.value = true;
+        digitalHumanSessionId.value = Date.now() * 1000 + Math.floor(Math.random() * 1000);
+        const msgId = `offer_${digitalHumanSessionId.value}`;
+        try {
+            digitalHumanPeer = new RTCPeerConnection();
+            digitalHumanStream = new MediaStream();
+            digitalHumanPeer.addTransceiver('audio', { direction: 'recvonly' });
+            digitalHumanPeer.addTransceiver('video', { direction: 'recvonly' });
+            digitalHumanPeer.ontrack = event => {
+                digitalHumanStream.addTrack(event.track);
+                if (avatarVideoRef.value) {
+                    avatarVideoRef.value.srcObject = digitalHumanStream;
+                    avatarVideoRef.value.play().catch(() => {});
+                }
+            };
+            digitalHumanPeer.onconnectionstatechange = () => {
+                digitalHumanReady.value = digitalHumanPeer?.connectionState === 'connected';
+            };
+            const offer = await digitalHumanPeer.createOffer();
+            await digitalHumanPeer.setLocalDescription(offer);
+            await waitForIceGathering(digitalHumanPeer);
+            const response = await fetch('/api/v1/digital-human/offer', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    sdp: digitalHumanPeer.localDescription.sdp,
+                    type: digitalHumanPeer.localDescription.type,
+                    session_id: digitalHumanSessionId.value,
+                    msg_id: msgId
+                })
+            });
+            if (!response.ok) throw new Error(await response.text());
+            const answer = await response.json();
+            await digitalHumanPeer.setRemoteDescription(answer);
+            await waitForPeerConnected(digitalHumanPeer);
+        } catch (error) {
+            console.error('数字人连接失败，将回退为原始音频播放', error);
+            closeDigitalHuman();
+        } finally {
+            digitalHumanConnecting.value = false;
+        }
+    };
+    const closeDigitalHuman = () => {
+        const sessionId = digitalHumanSessionId.value;
+        digitalHumanPeer?.close();
+        digitalHumanPeer = null;
+        digitalHumanStream = null;
+        digitalHumanReady.value = false;
+        if (avatarVideoRef.value) avatarVideoRef.value.srcObject = null;
+        if (sessionId) {
+            fetch('/api/v1/digital-human/close', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ session_id: sessionId, msg_id: `close_${Date.now()}` }),
+                keepalive: true
+            }).catch(() => {});
+        }
+        digitalHumanSessionId.value = null;
     };
     const drawText = async () => {
         if (textQueue.value.length > 0) {
@@ -388,6 +508,7 @@
         skipDisabled.value = true;
         playing.value = false;
         audioDOM?.pause();
+        closeDigitalHuman();
         stopMessage();
         if (socket) {
             socket.close();
@@ -412,6 +533,10 @@
             ],
             stream: true
         };
+        if (digitalHumanPeer && digitalHumanSessionId.value) {
+            obj.digital_human_session_id = digitalHumanSessionId.value;
+            obj.digital_human_msg_id = `reply_${Date.now()}`;
+        }
         isEnd.value = false;
         ctrl.abort();
         ctrl = new AbortController();
@@ -450,6 +575,10 @@
                 const data = JSON.parse(msg.data);
                 if (data.response_id) {
                     curResponseId.value = data.response_id;
+                }
+                if (data.choices[0]?.digital_human_audio === false) {
+                    console.warn('数字人音频注入失败，本段回退为浏览器原始音频播放');
+                    digitalHumanReady.value = false;
                 }
                 if (data.choices[0]?.text) {
                     textQueue.value += data.choices[0].text.replace('<end>', '');
@@ -547,6 +676,7 @@
             const remainLen = base64List.value.length;
             const blob = mergeBase64ToBlob(base64List.value);
             audioDOM.src = blob;
+            audioDOM.muted = digitalHumanReady.value;
             audioDOM.play();
             console.error('前期合并后播放开始时间: ', +new Date());
             audioDOM.onended = () => {
@@ -560,6 +690,7 @@
         if (isEnd.value && base64List.value.length >= 2) {
             const blob = mergeBase64ToBlob(base64List.value);
             audioDOM.src = blob;
+            audioDOM.muted = digitalHumanReady.value;
             audioDOM.play();
             console.error('合并后播放开始时间: ', +new Date());
             audioDOM.onended = () => {
@@ -633,6 +764,7 @@
         console.log('promise: ', +new Date());
         return new Promise(resolve => {
             audioDOM.src = 'data:audio/wav;base64,' + voice;
+            audioDOM.muted = digitalHumanReady.value;
             console.error('播放开始时间:', +new Date());
             audioDOM
                 .play()
@@ -827,6 +959,16 @@
             padding: 0 16px 16px;
             box-shadow: 0 0.5px 0 0 #e0e0e0;
             margin-bottom: 16px;
+            position: relative;
+            .digital-human-switch {
+                position: absolute;
+                right: 16px;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                color: rgba(23, 23, 23, 0.72);
+                font-size: 14px;
+            }
             .header-icon {
                 display: flex;
                 align-items: center;
@@ -865,6 +1007,8 @@
                 background: #f3f3f3;
                 flex-shrink: 0;
                 position: relative;
+                border-radius: 12px;
+                overflow: hidden;
                 video {
                     width: 100%;
                     height: 100%;
@@ -892,19 +1036,68 @@
             &-right {
                 margin-left: 16px;
                 flex: 1;
-                padding: 0 16px;
                 display: flex;
                 flex-direction: column;
-                .output-content {
+                min-width: 0;
+                position: relative;
+                border-radius: 12px;
+                overflow: hidden;
+                background: #f3f3f3;
+                .avatar-video-wrap {
+                    position: relative;
                     flex: 1;
+                    min-height: 0;
+                    video {
+                        width: 100%;
+                        height: 100%;
+                        object-fit: contain;
+                        background: #17191f;
+                    }
+                    .avatar-state {
+                        position: absolute;
+                        inset: 0;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        color: #8a8f9c;
+                        background: #eef0f4;
+                    }
+                }
+                .output-content {
+                    height: 132px;
+                    flex-shrink: 0;
                     overflow: auto;
+                    padding: 12px 16px;
+                    background: #fff;
+                    border-top: 1px solid #e6e8ee;
                 }
                 .skip-box {
                     display: flex;
                     align-items: center;
                     justify-content: flex-end;
-                    margin-top: 16px;
+                    padding: 8px 16px;
+                    background: #fff;
                 }
+                &.human-disabled {
+                    .output-content {
+                        height: auto;
+                        flex: 1;
+                        padding-top: 52px;
+                        border-top: 0;
+                    }
+                }
+            }
+            .panel-title {
+                position: absolute;
+                top: 12px;
+                left: 12px;
+                z-index: 3;
+                padding: 5px 10px;
+                border-radius: 999px;
+                color: #fff;
+                background: rgba(20, 24, 32, 0.66);
+                font-size: 13px;
+                backdrop-filter: blur(6px);
             }
         }
         &-btn {
