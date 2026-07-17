@@ -71,4 +71,4 @@ torchrun $DISTRIBUTED_ARGS finetune.py \
     --logging_steps 10 \
     --gradient_checkpointing true \
     --deepspeed ds_config_zero2.json \
-    --report_to "tensorboard"
+    --report_to "${REPORT_TO:-none}"

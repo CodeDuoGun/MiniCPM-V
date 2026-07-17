@@ -326,7 +326,8 @@
                     type: 'image_data',
                     image_data: {
                         data: count === maxCount ? strBase64 : '',
-                        type: 2
+                        type: 2,
+                        source: 'realtime_video'
                     }
                 });
                 if (count === maxCount) {

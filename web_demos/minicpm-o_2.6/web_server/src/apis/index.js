@@ -19,3 +19,10 @@ export const uploadConfig = data => {
     return useHttp.post('/api/v1/init_options', data);
     // return useHttp.post('/api/v1/upload_audio', data);
 };
+// 检查报告只能通过用户手动选择文件后调用；禁止传入实时视频帧。
+export const analyzeUploadedReport = data => {
+    return useHttp.post('/api/v1/reports/analyze', {
+        ...data,
+        source: 'manual_upload'
+    }, { timeout: 120000 });
+};

@@ -166,6 +166,7 @@
             .catch(() => {});
     };
     let audioContext;
+    let mediaStream;
     const analyser = ref();
     const dataArray = ref();
     let mediaRecorder;
@@ -175,12 +176,26 @@
     const isFirstPiece = ref(true);
 
     const startRecording = async () => {
-        // 获取用户音频流
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        // Explicitly request the browser's WebRTC audio processing. `ideal` keeps
+        // compatibility with devices that do not expose every constraint.
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                echoCancellation: { ideal: true },
+                noiseSuppression: { ideal: true },
+                autoGainControl: { ideal: true },
+                channelCount: { ideal: 1 },
+                sampleRate: { ideal: 16000 },
+                sampleSize: { ideal: 16 }
+            }
+        });
+
+        const audioTrack = mediaStream.getAudioTracks()[0];
+        console.info('Microphone audio settings:', audioTrack?.getSettings?.());
+        audioChunks = [];
 
         // 创建 AudioContext 和 MediaStreamAudioSourceNode
         audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-        const source = audioContext.createMediaStreamSource(stream);
+        const source = audioContext.createMediaStreamSource(mediaStream);
 
         analyser.value = audioContext.createAnalyser();
         // 将音频节点连接到分析器
@@ -228,6 +243,9 @@
         if (audioContext && audioContext.state !== 'closed') {
             audioContext.close();
         }
+        mediaStream?.getTracks().forEach(track => track.stop());
+        mediaStream = null;
+        audioChunks = [];
         ctrl.abort();
         ctrl = new AbortController();
         taskQueue.value = [];

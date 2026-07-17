@@ -22,11 +22,19 @@ def main() -> None:
     errors: list[str] = []
     ids: set[str] = set()
     image_count = 0
-    images_by_split: dict[str, set[str]] = {}
-    for split in ("train", "validation", "test"):
-        path = args.dataset_dir / f"{split}.json"
+    images_by_split: dict[str, set[str]] = {"train": set(), "validation": set(), "test": set()}
+    dataset_files = [
+        ("realtime", split, args.dataset_dir / f"{split}.json")
+        for split in ("train", "validation", "test")
+    ] + [
+        ("report_upload", split, args.dataset_dir / f"report_upload_{split}.json")
+        for split in ("train", "validation", "test")
+    ]
+    for dataset_kind, split, path in dataset_files:
+        if not path.is_file():
+            errors.append(f"missing dataset file: {path.name}")
+            continue
         samples = json.loads(path.read_text(encoding="utf-8"))
-        images_by_split[split] = set()
         for sample in samples:
             sid = sample.get("id", "")
             if sid in ids:
@@ -53,10 +61,17 @@ def main() -> None:
             found_placeholders = set(re.findall(r"<image(?:_\d+)?>", user_content))
             if found_placeholders != expected_placeholders:
                 errors.append(f"{sid}: image placeholder set mismatch")
-            blob = json.dumps(sample, ensure_ascii=False)
+            # Image filenames are content hashes and can coincidentally contain
+            # 11 or 15 digits. Privacy validation applies to conversational text.
+            blob = json.dumps(conversations, ensure_ascii=False)
             if PII_RE.search(blob):
                 errors.append(f"{sid}: possible direct identifier")
             answer = conversations[-1].get("content", "") if conversations else ""
+            if dataset_kind == "realtime":
+                if "实时视频严禁读取" not in user_content or "手动上传入口" not in user_content:
+                    errors.append(f"{sid}: missing realtime report prohibition")
+            elif "手动上传入口" not in user_content or "不是实时视频帧" not in user_content:
+                errors.append(f"{sid}: missing explicit manual-upload provenance")
             if UNSAFE_RE.search(answer):
                 errors.append(f"{sid}: unsafe diagnosis/prescription-like wording")
             if "急诊" not in answer:

@@ -6,7 +6,7 @@ Pipeline:
   analyze  -> VLM classification for tongue/lesion images and OCR for reports
   redact   -> cover VLM-detected PII regions in report images
   verify   -> second VLM pass that rejects report images with visible PII
-  build    -> native MiniCPM ``id + image + conversations`` JSON files
+  build    -> separate realtime-clinical and manual-report-upload datasets
 
 All API results are cached as JSONL and every stage is resumable. Report images
 fail closed: production build excludes them unless redaction verification says
@@ -21,7 +21,6 @@ import concurrent.futures
 import hashlib
 import importlib
 import json
-import math
 import mimetypes
 import os
 import random
@@ -49,14 +48,21 @@ DEFAULT_DIALOGUES = Path(
 DEFAULT_MEDICAL_ROOT = Path("/Users/tangxueduo/Projects/LLaMA-Factory")
 DEFAULT_OUTPUT = Path("data/wuweiping_vlm_pretriage")
 
-SYSTEM_POLICY = (
-    "你是线上预问诊助手，只做病史采集、图片客观描述、风险提示和就医建议。"
+REALTIME_SYSTEM_POLICY = (
+    "你是实时音视频预问诊助手，只做病史采集、舌象/面象/患处的客观描述、风险提示和就医建议。"
     "不能做最终诊断，不能替代线下医生，不能开具处方或给出具体用药方案。"
-    "图片只能用于记录舌面、患处和检查报告中的可见信息，不能据此确诊。"
+    "实时视频严禁读取、转写、概括或解释任何检查报告、处方、病历、证件和其他文档内容；"
+    "看到疑似文档时，只能请用户停止展示，并通过检查报告手动上传入口提交，由独立VLM接口分析。"
+    "实时图片只能用于记录舌面、面部和患处的可见信息，不能据此确诊。"
     "回答简洁、温和，先追问关键病史，再给风险提示。"
     "遇到胸痛、呼吸困难、意识障碍、高热不退、严重过敏等危险信号，建议立即就医或急诊。"
     "儿童、孕妇或哺乳期，以及肝肾功能异常者，必须先询问年龄体重、孕哺情况、过敏史、"
     "基础病、肝肾功能和正在使用的药物等禁忌信息。"
+)
+REPORT_UPLOAD_SYSTEM_POLICY = (
+    "你是检查报告手动上传分析助手。当前图片必须来自用户主动选择文件后的独立上传入口，"
+    "不得把实时视频帧当作报告输入。你只能读取报告中真实可见的项目、数值、单位、参考范围和异常标记，"
+    "必须提示OCR可能有误并要求医生复核；不能确诊、不能开处方或给出具体用药方案。"
 )
 DIRECT_ID_RE = re.compile(
     r"(?<!\d)(?:1\d{10}|\d{17}[\dXx]|\d{15})(?!\d)|"
@@ -64,6 +70,11 @@ DIRECT_ID_RE = re.compile(
 )
 DIAGNOSIS_PHRASE_RE = re.compile(
     r"(?:考虑|诊断为|确诊为|提示为|符合)\s*[^，。；\n]{1,40}"
+)
+DIRECT_NUMBER_RE = re.compile(r"(?<!\d)(?:1\d{10}|\d{17}[\dXx]|\d{15})(?!\d)")
+NON_REPORT_DOCUMENT_RE = re.compile(
+    r"处方|诊断|主诉|现病史|体格检查|病历(?:号)?|就诊号|住院号|处方号|"
+    r"药品(?:名称)?|用法|用量|嘱托|治疗(?:方案|记录)?|科室"
 )
 SYMPTOMS = (
     "潮红", "红斑", "丘疹", "脓疱", "脓包", "结节", "瘙痒", "发痒", "发烫", "灼热",
@@ -645,19 +656,34 @@ def report_answer(analyses: list[dict[str, Any]], record: dict[str, Any]) -> str
     return "\n".join(lines)
 
 
+def is_supported_uploaded_report(analysis: dict[str, Any]) -> bool:
+    """Exclude prescriptions, clinical notes and pages carrying direct IDs."""
+
+    for item in analysis.get("items") or []:
+        name = str(item.get("name") or "")
+        value = str(item.get("value") or "")
+        if NON_REPORT_DOCUMENT_RE.search(name) or DIRECT_NUMBER_RE.search(value):
+            return False
+    return True
+
+
 def make_sample(
     record: dict[str, Any], entries: list[dict[str, Any]], analyses: list[dict[str, Any]], paths: list[Path], category: str
 ) -> dict[str, Any]:
     image, placeholders = native_image_value(paths)
-    modality = "舌面/患处" if category.startswith("clinical") else "检查报告" if category.startswith("report") else "舌面/患处及检查报告"
-    user = f"{placeholders}\n任务要求：{SYSTEM_POLICY}\n以上为{modality}图片。请逐图客观记录，并继续收集线上预问诊所需信息。\n{profile_text(record)}"
-    if category == "combined":
-        clinical = [a for a in analyses if a.get("source_field") == "tongue_face_img"]
-        reports = [a for a in analyses if a.get("source_field") == "admin_report_img"]
-        answer = clinical_answer(clinical, record) + "\n" + report_answer(reports, record)
-    elif category.startswith("clinical"):
+    if category.startswith("clinical"):
+        user = (
+            f"{placeholders}\n任务要求：{REALTIME_SYSTEM_POLICY}\n"
+            f"以上为实时音视频会话采集的舌面/面部/患处画面。请逐图客观记录，并继续收集预问诊信息。\n"
+            f"{profile_text(record)}"
+        )
         answer = clinical_answer(analyses, record)
     else:
+        user = (
+            f"{placeholders}\n任务要求：{REPORT_UPLOAD_SYSTEM_POLICY}\n"
+            f"以上检查报告由用户通过独立的检查报告手动上传入口提交，不是实时视频帧。"
+            f"请读取可见项目并继续收集必要病史。\n{profile_text(record)}"
+        )
         answer = report_answer(analyses, record)
     signature = ":".join(entry["image_id"] for entry in entries)
     return {
@@ -674,23 +700,9 @@ def chunks(items: list[Any], size: int) -> Iterable[list[Any]]:
         yield items[index : index + size]
 
 
-def balance_categories(samples: list[dict[str, Any]], seed: str) -> list[dict[str, Any]]:
-    by_category: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for sample in samples:
-        family = "clinical" if sample["_category"].startswith("clinical") else "report" if sample["_category"].startswith("report") else "combined"
-        by_category[family].append(sample)
-    rng = random.Random(seed)
-    for values in by_category.values():
-        rng.shuffle(values)
-    clinical = by_category["clinical"]
-    if not clinical:
-        result = by_category["report"] + by_category["combined"]
-        rng.shuffle(result)
-        return result
-    report_limit = math.ceil(len(clinical) * 0.20 / 0.70)
-    combined_limit = math.ceil(len(clinical) * 0.10 / 0.70)
-    result = clinical + by_category["report"][:report_limit] + by_category["combined"][:combined_limit]
-    rng.shuffle(result)
+def shuffled(samples: list[dict[str, Any]], seed: str) -> list[dict[str, Any]]:
+    result = list(samples)
+    random.Random(seed).shuffle(result)
     return result
 
 
@@ -747,6 +759,8 @@ def command_build(args: argparse.Namespace) -> None:
             verified = verification.get(image_id, {}).get("pii_clear") is True
             if analysis.get("image_type") != "report" or not is_complete_image(path):
                 continue
+            if not is_supported_uploaded_report(analysis):
+                continue
             if not verified and not args.allow_unverified_reports:
                 continue
             target = report_by_record
@@ -754,25 +768,23 @@ def command_build(args: argparse.Namespace) -> None:
             if occurrence["record_id"] in records:
                 target[occurrence["record_id"]].append((entry, analysis, path))
 
-    candidates: dict[str, list[dict[str, Any]]] = {"train": [], "validation": [], "test": []}
+    realtime_candidates: dict[str, list[dict[str, Any]]] = {"train": [], "validation": [], "test": []}
+    report_upload_candidates: dict[str, list[dict[str, Any]]] = {"train": [], "validation": [], "test": []}
     for rid, record in records.items():
         clinical = sorted(clinical_by_record.get(rid, []), key=lambda item: item[0]["image_id"])
         reports = sorted(report_by_record.get(rid, []), key=lambda item: item[0]["image_id"])
         component = components.get(record["patient_key"], record["patient_key"])
         split = split_name(component, args.seed)
         for item in clinical:
-            candidates[split].append(make_sample(record, [item[0]], [item[1]], [item[2]], "clinical_single"))
+            realtime_candidates[split].append(make_sample(record, [item[0]], [item[1]], [item[2]], "clinical_single"))
         for group in chunks(clinical, args.max_clinical_group):
             if len(group) > 1:
-                candidates[split].append(make_sample(record, [x[0] for x in group], [x[1] for x in group], [x[2] for x in group], "clinical_group"))
+                realtime_candidates[split].append(make_sample(record, [x[0] for x in group], [x[1] for x in group], [x[2] for x in group], "clinical_group"))
         for item in reports:
-            candidates[split].append(make_sample(record, [item[0]], [item[1]], [item[2]], "report_single"))
+            report_upload_candidates[split].append(make_sample(record, [item[0]], [item[1]], [item[2]], "report_upload_single"))
         for group in chunks(reports, args.max_report_group):
             if len(group) > 1:
-                candidates[split].append(make_sample(record, [x[0] for x in group], [x[1] for x in group], [x[2] for x in group], "report_group"))
-        if clinical and reports:
-            group = clinical[: args.max_combined_each] + reports[: args.max_combined_each]
-            candidates[split].append(make_sample(record, [x[0] for x in group], [x[1] for x in group], [x[2] for x in group], "combined"))
+                report_upload_candidates[split].append(make_sample(record, [x[0] for x in group], [x[1] for x in group], [x[2] for x in group], "report_upload_group"))
 
     stats: dict[str, Any] = {
         "manifest_images": len(manifest),
@@ -780,10 +792,16 @@ def command_build(args: argparse.Namespace) -> None:
         "verified_report_images": sum(item.get("pii_clear") is True for item in verification.values()),
         "build_is_partial": len(analyses) < len(manifest),
         "allow_unverified_reports": args.allow_unverified_reports,
-        "splits": {},
+        "dataset_policy": {
+            "realtime": "clinical images only; report/document OCR is prohibited",
+            "report_upload": "verified report images from the explicit manual-upload path only",
+            "combined_samples": 0,
+        },
+        "realtime_splits": {},
+        "report_upload_splits": {},
     }
-    for split, values in candidates.items():
-        selected = balance_categories(values, f"{args.seed}:{split}")
+    for split, values in realtime_candidates.items():
+        selected = shuffled(values, f"{args.seed}:realtime:{split}")
         if split == "train":
             selected = add_red_flag_samples(selected, args.red_flag_samples)
         category_counts = Counter(item["_category"] for item in selected)
@@ -791,7 +809,17 @@ def command_build(args: argparse.Namespace) -> None:
         for item in selected:
             public.append({key: value for key, value in item.items() if not key.startswith("_")})
         write_json(output / f"{split}.json", public)
-        stats["splits"][split] = {
+        stats["realtime_splits"][split] = {
+            "candidate_count": len(values),
+            "selected_count": len(public),
+            "categories": dict(category_counts),
+        }
+    for split, values in report_upload_candidates.items():
+        selected = shuffled(values, f"{args.seed}:report-upload:{split}")
+        category_counts = Counter(item["_category"] for item in selected)
+        public = [{key: value for key, value in item.items() if not key.startswith("_")} for item in selected]
+        write_json(output / f"report_upload_{split}.json", public)
+        stats["report_upload_splits"][split] = {
             "candidate_count": len(values),
             "selected_count": len(public),
             "categories": dict(category_counts),
@@ -834,7 +862,6 @@ def parse_args() -> argparse.Namespace:
     build.add_argument("--seed", default="20260715")
     build.add_argument("--max-clinical-group", type=int, default=4)
     build.add_argument("--max-report-group", type=int, default=4)
-    build.add_argument("--max-combined-each", type=int, default=2)
     build.add_argument("--allow-unverified-reports", action="store_true", help="仅限开发；生产数据不应使用")
     build.add_argument("--red-flag-samples", type=int, default=50)
     return parser.parse_args()

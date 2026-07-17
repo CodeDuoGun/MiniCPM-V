@@ -62,6 +62,15 @@
             </div>
         </div>
         <div class="video-page-btn">
+            <el-upload
+                :auto-upload="false"
+                :show-file-list="false"
+                accept="image/jpeg,image/png,image/webp"
+                :on-change="handleReportUpload"
+                :disabled="reportUploading"
+            >
+                <el-button :loading="reportUploading">手动上传检查报告</el-button>
+            </el-upload>
             <el-button v-show="!isCalling" type="success" :disabled="callDisabled" @click="initRecording">
                 {{ callDisabled ? t('notReadyBtn') : t('videoCallBtn') }}
             </el-button>
@@ -75,7 +84,7 @@
     </div>
 </template>
 <script setup>
-    import { sendMessage, stopMessage, uploadConfig } from '@/apis';
+    import { analyzeUploadedReport, sendMessage, stopMessage, uploadConfig } from '@/apis';
     import { encodeWAV } from '@/hooks/useVoice';
     import { getNewUserId, setNewUserId } from '@/hooks/useRandomId';
     import { fetchEventSource } from '@microsoft/fetch-event-source';
@@ -126,6 +135,7 @@
     const stop = ref(false);
     const isFrontCamera = ref(true);
     const loading = ref(false);
+    const reportUploading = ref(false);
 
     const isEnd = ref(false); // sse接口关闭，认为模型已完成本次返回
 
@@ -196,6 +206,48 @@
     const delay = ms => {
         return new Promise(resolve => setTimeout(resolve, ms));
     };
+    const readFileAsDataUrl = file =>
+        new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(file);
+        });
+    const handleReportUpload = async uploadFile => {
+        const file = uploadFile.raw;
+        if (!file || !['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+            ElMessage.error('请手动选择 JPG、PNG 或 WebP 格式的检查报告图片');
+            return;
+        }
+        if (file.size > 15 * 1024 * 1024) {
+            ElMessage.error('检查报告图片不能超过 15MB');
+            return;
+        }
+        reportUploading.value = true;
+        try {
+            const dataUrl = await readFileAsDataUrl(file);
+            const { code, message, data } = await analyzeUploadedReport({
+                mime_type: file.type,
+                image_data: dataUrl.split(',')[1]
+            });
+            if (code !== 0) throw new Error(message);
+            const analysis = data.analysis || {};
+            const items = (analysis.items || [])
+                .slice(0, 12)
+                .map(item => `${item.name || '项目'}：${item.value || '未读清'}${item.unit || ''}${item.flag && item.flag !== '正常' ? `（${item.flag}）` : ''}`)
+                .join('；');
+            outputData.value.push({
+                type: 'BOT',
+                text: `检查报告上传分析：${analysis.summary || items || '未读取到可靠项目'}\n${data.disclaimer}`,
+                audio: ''
+            });
+            ElMessage.success('检查报告已通过独立 VLM 接口分析');
+        } catch (error) {
+            ElMessage.error(error.message || '检查报告分析失败');
+        } finally {
+            reportUploading.value = false;
+        }
+    };
     const initRecording = async () => {
         uploadUserConfig()
             .then(async () => {
@@ -247,8 +299,18 @@
             try {
                 mediaStream = await window.navigator.mediaDevices.getUserMedia({
                     video: { facingMode },
-                    audio: true
+                    audio: {
+                        echoCancellation: { ideal: true },
+                        noiseSuppression: { ideal: true },
+                        autoGainControl: { ideal: true },
+                        channelCount: { ideal: 1 },
+                        sampleRate: { ideal: 16000 },
+                        sampleSize: { ideal: 16 }
+                    }
                 });
+                const audioTrack = mediaStream.getAudioTracks()[0];
+                console.info('Microphone audio settings:', audioTrack?.getSettings?.());
+                audioChunks = [];
                 videoStream.value = mediaStream;
                 videoRef.value.srcObject = mediaStream;
                 loading.value = false;
@@ -453,7 +515,8 @@
                     type: 'image_data',
                     image_data: {
                         data: count === maxCount ? strBase64 : '',
-                        type: 2
+                        type: 2,
+                        source: 'realtime_video'
                     }
                 });
                 if (count === maxCount) {
@@ -1107,7 +1170,10 @@
             }
         }
         &-btn {
-            text-align: center;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 12px;
             padding: 8px 0;
             .el-button {
                 width: 284px;

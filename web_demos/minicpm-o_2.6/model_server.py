@@ -3,12 +3,12 @@ import json
 import asyncio
 import numpy as np
 import os, sys, io
+import re
 import threading
 import time
 import aiofiles
 import librosa
 import soundfile
-import wave
 import urllib.error
 import urllib.request
 from typing import Dict, List, Any, Optional
@@ -28,6 +28,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 cur_path = os.path.split(os.path.realpath(__file__))[0]
 sys.path.append(os.path.abspath(cur_path))
 import vad_utils
+from realtime_video_policy import (
+    REALTIME_DOCUMENT_NOTICE,
+    document_likeness,
+    is_manual_report_upload,
+)
 
 def setup_logger():
     logger = logging.getLogger("api_logger")
@@ -66,6 +71,9 @@ ap.add_argument('--adapter', type=str, default="", help="optional LoRA adapter p
 ap.add_argument('--merge-lora', action=argparse.BooleanOptionalAction, default=True, help="merge LoRA adapter into the base model for inference")
 ap.add_argument('--system-prompt', type=str, default="", help="assistant system prompt used for the realtime session")
 ap.add_argument('--human-service-url', type=str, default="http://127.0.0.1:8010/aihuman", help="Wav2Lip digital-human service API base URL")
+ap.add_argument('--report-vlm-base-url', type=str, default=os.getenv("REPORT_VLM_BASE_URL", ""), help="OpenAI-compatible VLM base URL for manual report uploads")
+ap.add_argument('--report-vlm-api-key', type=str, default=os.getenv("REPORT_VLM_API_KEY", ""), help="VLM API key; prefer REPORT_VLM_API_KEY")
+ap.add_argument('--report-vlm-model', type=str, default=os.getenv("REPORT_VLM_MODEL", ""), help="VLM model used only by the manual report-upload endpoint")
 args = ap.parse_args()
 
 TCM_SYSTEM_PROMPT = (
@@ -73,6 +81,8 @@ TCM_SYSTEM_PROMPT = (
     "你需要围绕主诉、现病史、既往史、过敏史、当前用药和外用药反应、饮食、睡眠、二便、"
     "寒热汗出、口渴口苦、疼痛性质、情绪压力、女性月经/孕产情况等逐步追问。"
     "如果用户提供舌面、面部、患处或其他图片/视频，应结合可见信息提出后续问诊问题，但不要仅凭图片下最终诊断。"
+    "实时视频画面严禁读取、转写、概括或解释检查报告、处方、病历、证件及其他文档内容。"
+    "如果镜头中出现疑似文档，只能请用户停止展示，并通过检查报告手动上传入口提交，由独立VLM接口分析。"
     "你的回答要像线上问诊医生一样简洁自然，一次优先问1到3个关键问题，避免长篇科普。"
     "不要替代医生做最终诊断、不要直接开处方或承诺疗效；涉及急症、严重过敏、持续高热、胸痛、呼吸困难、意识异常、"
     "孕产妇/儿童高风险情况时，应建议及时线下就医。"
@@ -87,6 +97,117 @@ TCM_IDENTITY_PROMPT = (
 )
 
 CHINESE_VOICE_PROMPT = "模仿输入音频中的声音特征，并始终使用简体中文生成回复。"
+
+REPORT_UPLOAD_PROMPT = """你是检查报告手动上传分析助手。图片来自用户主动选择文件后的独立上传入口，不是实时视频帧。
+只读取图片中真实可见的检查项目、结果、单位、参考范围、异常箭头或异常标记；不得复述姓名、证件号、手机号、
+地址、就诊号、住院号、条码或二维码。不得诊断、推测病因、推荐药物或开处方。看不清时明确写“未读清”。
+仅返回 JSON 对象：
+{
+  "report_type": "报告类型或未知",
+  "report_date": "YYYY-MM-DD或未知",
+  "quality": "usable|limited|unusable",
+  "items": [{"name":"项目名","value":"结果","unit":"单位或无","reference":"参考范围或无","flag":"高|低|正常|异常|未知"}],
+  "summary": "不含身份信息的客观摘要",
+  "limitations": ["OCR可能有误，请以报告原件和医生复核为准"],
+  "next_questions": ["检查原因和当前症状"]
+}
+最多返回30个最清晰项目。仅输出 JSON。"""
+REPORT_PRIVATE_FIELD_RE = re.compile(
+    r"姓名|身份证|手机号|电话|地址|就诊号|住院号|病历号|条码|二维码|处方号"
+)
+REPORT_UNSUPPORTED_FIELD_RE = re.compile(
+    r"处方|诊断|主诉|现病史|体格检查|病历|药品|用法|用量|嘱托|治疗记录"
+)
+DIRECT_IDENTIFIER_RE = re.compile(r"(?<!\d)(?:1\d{10}|\d{17}[\dXx]|\d{15})(?!\d)")
+
+
+def _report_vlm_url(base_url: str) -> str:
+    base_url = base_url.rstrip("/")
+    return base_url if base_url.endswith("/chat/completions") else base_url + "/chat/completions"
+
+
+def _extract_json_object(text_value: str) -> Dict[str, Any]:
+    text_value = text_value.strip()
+    if text_value.startswith("```"):
+        text_value = text_value.strip("`").removeprefix("json").strip()
+    start, end = text_value.find("{"), text_value.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("VLM response does not contain a JSON object")
+    value = json.loads(text_value[start:end + 1])
+    if not isinstance(value, dict):
+        raise ValueError("VLM response must be a JSON object")
+    return value
+
+
+def _sanitize_report_analysis(value: Dict[str, Any]) -> Dict[str, Any]:
+    items = []
+    unsupported = False
+    for raw_item in value.get("items") or []:
+        if not isinstance(raw_item, dict):
+            continue
+        name = str(raw_item.get("name") or "")[:80]
+        item_value = str(raw_item.get("value") or "")[:120]
+        if REPORT_PRIVATE_FIELD_RE.search(name) or DIRECT_IDENTIFIER_RE.search(item_value):
+            continue
+        if REPORT_UNSUPPORTED_FIELD_RE.search(name):
+            unsupported = True
+            continue
+        items.append({
+            "name": name,
+            "value": item_value,
+            "unit": str(raw_item.get("unit") or "")[:40],
+            "reference": str(raw_item.get("reference") or "")[:80],
+            "flag": str(raw_item.get("flag") or "未知")[:10],
+        })
+        if len(items) >= 30:
+            break
+    summary = DIRECT_IDENTIFIER_RE.sub("[已脱敏]", str(value.get("summary") or "")[:500])
+    if unsupported and not items:
+        summary = "该图片疑似处方、病历或诊断记录，不属于当前检查报告分析范围，请上传化验、影像、病理或其他客观检查报告。"
+    return {
+        "report_type": str(value.get("report_type") or "未知")[:80],
+        "report_date": str(value.get("report_date") or "未知")[:20],
+        "quality": value.get("quality") if value.get("quality") in {"usable", "limited", "unusable"} else "limited",
+        "items": items,
+        "summary": summary,
+        "limitations": ["OCR可能有误，请以报告原件和医生复核为准"],
+        "next_questions": [str(item)[:160] for item in (value.get("next_questions") or [])[:5]],
+        "unsupported_document": unsupported and not items,
+    }
+
+
+def analyze_manually_uploaded_report(image_data: str, mime_type: str) -> Dict[str, Any]:
+    if not args.report_vlm_base_url or not args.report_vlm_api_key or not args.report_vlm_model:
+        raise RuntimeError("manual report VLM is not configured")
+    try:
+        image_bytes = base64.b64decode(image_data, validate=True)
+        if not image_bytes or len(image_bytes) > 15 * 1024 * 1024:
+            raise ValueError("report image must be between 1 byte and 15 MB")
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image.verify()
+    except Exception as exc:
+        raise ValueError("invalid report image_data") from exc
+    payload = {
+        "model": args.report_vlm_model,
+        "temperature": 0,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{image_data}"}},
+                {"type": "text", "text": REPORT_UPLOAD_PROMPT},
+            ],
+        }],
+    }
+    request = urllib.request.Request(
+        _report_vlm_url(args.report_vlm_base_url),
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Authorization": f"Bearer {args.report_vlm_api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    content = result["choices"][0]["message"]["content"]
+    return _sanitize_report_analysis(_extract_json_object(content))
 
 
 class StreamManager:
@@ -110,6 +231,7 @@ class StreamManager:
         self.audio_prefill = []
         self.audio_input = []
         self.image_prefill = None
+        self.report_frame_blocked = False
         self.audio_chunk = 200
 
         # customized options
@@ -231,20 +353,67 @@ class StreamManager:
         # clear model
         self.clear()
 
-    def merge_wav_files(self, input_bytes_list, output_file):
-        with wave.open(io.BytesIO(input_bytes_list[0]), 'rb') as wav:
-            params = wav.getparams()
-            n_channels, sampwidth, framerate, n_frames, comptype, compname = params
-            
-        with wave.open(output_file, 'wb') as output_wav:
-            output_wav.setnchannels(n_channels)
-            output_wav.setsampwidth(sampwidth)
-            output_wav.setframerate(framerate)
-            output_wav.setcomptype(comptype, compname)
-        
-            for wav_bytes in input_bytes_list:
-                with wave.open(io.BytesIO(wav_bytes), 'rb') as wav:
-                    output_wav.writeframes(wav.readframes(wav.getnframes()))
+    def merge_wav_files(self, input_bytes_list, output_file, target_sr=16000):
+        """Decode, normalize and concatenate browser WAV chunks.
+
+        Browsers are allowed to ignore the requested AudioContext sample rate.  In
+        that case a microphone commonly produces 48 kHz chunks.  Concatenating
+        their PCM bytes and later relabelling them as 16 kHz slows the speech down
+        and creates the characteristic metallic/mechanical sound.  Always decode
+        the header and perform a real resample before the model/VAD sees the audio.
+        """
+        if not input_bytes_list:
+            raise ValueError("cannot merge an empty audio chunk list")
+
+        normalized_chunks = []
+        for wav_bytes in input_bytes_list:
+            audio, source_sr = soundfile.read(
+                io.BytesIO(wav_bytes), dtype="float32", always_2d=True
+            )
+            if audio.size == 0:
+                continue
+
+            # The speech model expects mono input. Averaging is safer than silently
+            # selecting one channel when a browser/device returns stereo audio.
+            audio = np.mean(audio, axis=1)
+            if source_sr != target_sr:
+                audio = librosa.resample(
+                    audio,
+                    orig_sr=source_sr,
+                    target_sr=target_sr,
+                    res_type="kaiser_best",
+                )
+            normalized_chunks.append(np.asarray(audio, dtype=np.float32))
+
+        if not normalized_chunks:
+            raise ValueError("all received audio chunks are empty")
+
+        # Suppress clicks caused by a dropped/restarted browser chunk. The sample
+        # recording showed large discontinuities exactly on 200 ms boundaries.
+        # Spread only abnormal jumps over 2 ms; normal continuous joins are left
+        # untouched so speech detail is not blurred.
+        fade_samples = max(1, int(target_sr * 0.002))
+        for index in range(1, len(normalized_chunks)):
+            previous = normalized_chunks[index - 1]
+            current = normalized_chunks[index]
+            if previous.size < fade_samples or current.size < fade_samples:
+                continue
+            join_delta = float(current[0] - previous[-1])
+            if abs(join_delta) < 0.15:
+                continue
+            half_delta = join_delta / 2.0
+            previous[-fade_samples:] += np.linspace(
+                0.0, half_delta, fade_samples, dtype=np.float32
+            )
+            current[:fade_samples] -= np.linspace(
+                half_delta, 0.0, fade_samples, dtype=np.float32
+            )
+
+        merged_audio = np.concatenate(normalized_chunks)
+        # Guard against invalid samples and clipping before encoding PCM16.
+        merged_audio = np.nan_to_num(merged_audio, nan=0.0, posinf=1.0, neginf=-1.0)
+        merged_audio = np.clip(merged_audio, -1.0, 1.0)
+        soundfile.write(output_file, merged_audio, target_sr, subtype="PCM_16")
 
     
     def is_timed_out(self):
@@ -268,9 +437,9 @@ class StreamManager:
         logger.info(f'msg_type is {msg_type}')
         tcm_assistant_prompt = args.system_prompt.strip() or TCM_SYSTEM_PROMPT
         options = self.customized_options or {}
-        patient_gender = str(options.get("patient_gender") or options.get("gender") or "未知").strip()
-        patient_age = str(options.get("patient_age") or options.get("age") or "未知").strip()
-        visit_type = str(options.get("visit_type") or "未知").strip()
+        patient_gender = str(options.get("patient_gender", "女") or options.get("gender") or "未知").strip()
+        patient_age = str(options.get("patient_age", 35) or options.get("age") or "未知").strip()
+        visit_type = str(options.get("visit_type", "初诊") or "未知").strip()
         patient_context = (
             f"当前用户基本信息：性别：{patient_gender}；年龄：{patient_age}；"
             f"就诊类型：{visit_type}。请结合这些信息开始问诊，不要重复询问已经提供的信息。"
@@ -324,11 +493,19 @@ class StreamManager:
             self.customized_options is None
             or self.customized_options.get('use_audio_prompt', 1) > 0
         )
+        # Newer MiniCPM-o releases expose explicit cache reset APIs, while the
+        # default 2.6 remote code may not. Re-anchor the vocoder when supported
+        # without breaking deployments that still use the 2.6 API.
+        if hasattr(self.minicpmo_model, "reset_session"):
+            self.minicpmo_model.reset_session(reset_token2wav_cache=True)
+        if hasattr(self.minicpmo_model, "init_token2wav_cache"):
+            self.minicpmo_model.init_token2wav_cache(prompt_speech_16k=audio_prompt)
         if msg_type in (0, 2) or use_audio_prompt:
             self.minicpmo_model.streaming_prefill(
                 session_id=str(self.session_id),
                 msgs=msgs,
                 tokenizer=self.minicpmo_tokenizer,
+                is_last_chunk=True,
             )
             
         self.savedir = os.path.join(f"./log_data/{args.port}/", str(time.time()))
@@ -360,6 +537,7 @@ class StreamManager:
             self.audio_prefill = []
             self.audio_input = []
             self.image_prefill = None
+            self.report_frame_blocked = False
             
             if self.minicpmo_model.llm_past_key_values[0][0].shape[2]>8192:
                 self.session_id += 1  # to clear all kv cache
@@ -387,6 +565,8 @@ class StreamManager:
                     audio_data = content_item["input_audio"]["data"]
                     audio_timestamp = content_item["input_audio"].get("timestamp", "")
                 elif content_item["type"] == "image_data":
+                    if content_item["image_data"].get("source", "realtime_video") != "realtime_video":
+                        raise ValueError("stream image_data only accepts source=realtime_video")
                     image_data = content_item["image_data"]["data"]
             if audio_data is None:
                 return "empty audio"
@@ -407,7 +587,14 @@ class StreamManager:
                         image_bytes = base64.b64decode(image_data)
                         image_buffer = io.BytesIO(image_bytes)
                         image_buffer.seek(0)
-                        image = Image.open(image_buffer)
+                        candidate_image = Image.open(image_buffer).convert("RGB")
+                        blocked, metrics = document_likeness(candidate_image)
+                        if blocked:
+                            logger.warning(f"blocked document-like realtime frame: {metrics}")
+                            self.image_prefill = None
+                            self.report_frame_blocked = True
+                        else:
+                            image = candidate_image
                         # logger.info("read image")
 
                 if self.sys_prompt_flag is False:
@@ -503,10 +690,7 @@ class StreamManager:
                 time_prefill = time.time()
                 input_audio_path = self.savedir + f"/input_audio_log/input_audio_{self.input_audio_id}.wav"
                 self.merge_wav_files(self.audio_prefill, input_audio_path)
-                with open(input_audio_path,"rb") as wav_io:
-                    signal, sr = soundfile.read(wav_io, dtype='float32')
-                    soundfile.write(input_audio_path, signal, 16000)
-                    audio_np, sr = librosa.load(input_audio_path, sr=16000, mono=True)
+                audio_np, sr = soundfile.read(input_audio_path, dtype='float32')
                 self.audio_prefill = []
 
                 if len(audio_np) > 16000:
@@ -521,6 +705,9 @@ class StreamManager:
                     cnts = None
                     if self.image_prefill is not None:
                         cnts = ["<unit>", self.image_prefill, audio_np]
+                    elif self.report_frame_blocked:
+                        cnts = [REALTIME_DOCUMENT_NOTICE, audio_np]
+                        self.report_frame_blocked = False
                     else:
                         cnts = [audio_np]
                         
@@ -964,6 +1151,46 @@ async def stop_response(request: Request, uid: Optional[str] = Header(None)):
         }
     }
     return JSONResponse(content=response, status_code=200)
+
+
+@app.post("/api/v1/reports/analyze")
+async def analyze_report_upload(request: Request, uid: Optional[str] = Header(None)):
+    """Analyze an explicitly uploaded report outside the realtime session."""
+    if not uid:
+        raise HTTPException(status_code=400, detail="Missing uid in headers")
+    payload = await request.json()
+    if not is_manual_report_upload(payload):
+        raise HTTPException(
+            status_code=400,
+            detail="Reports must use the explicit manual-upload path with source=manual_upload",
+        )
+    image_data = payload.get("image_data", "")
+    mime_type = payload.get("mime_type", "image/jpeg")
+    if not isinstance(image_data, str) or not image_data:
+        raise HTTPException(status_code=400, detail="Missing base64 image_data")
+    if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
+        raise HTTPException(status_code=400, detail="Unsupported report image type")
+    try:
+        result = await asyncio.to_thread(analyze_manually_uploaded_report, image_data, mime_type)
+        return JSONResponse(
+            content={
+                "id": uid,
+                "source": "manual_upload",
+                "analysis": result,
+                "disclaimer": "OCR可能有误，请以报告原件和医生复核为准。",
+            },
+            status_code=200,
+        )
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except urllib.error.HTTPError as exc:
+        logger.error(f"report VLM HTTP error: {exc.code}")
+        raise HTTPException(status_code=502, detail="Report VLM request failed")
+    except urllib.error.URLError as exc:
+        logger.error(f"report VLM network error: {exc.reason}")
+        raise HTTPException(status_code=502, detail="Report VLM is unavailable")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 @app.post("/api/v1/digital-human/offer")
