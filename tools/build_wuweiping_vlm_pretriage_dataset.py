@@ -46,6 +46,7 @@ DEFAULT_DIALOGUES = Path(
 ).resolve().parents[1] / "outputs/medical_sft_minicpmo/tcm_consult_minicpmo.json"
 DEFAULT_MEDICAL_ROOT = Path("/Users/tangxueduo/Projects/LLaMA-Factory")
 DEFAULT_OUTPUT = Path("data/wuweiping_vlm_pretriage")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 REALTIME_SYSTEM_POLICY = (
     "你是实时音视频预问诊助手，只做病史采集、舌象/面象/患处的客观描述、风险提示和就医建议。"
@@ -695,10 +696,16 @@ def split_name(component: str, seed: str) -> str:
 
 
 def native_image_value(paths: list[Path]) -> tuple[str | dict[str, str], str]:
-    absolute = [str(path.resolve()) for path in paths]
-    if len(absolute) == 1:
-        return absolute[0], "<image>"
-    value = {f"<image_{index:02d}>": path for index, path in enumerate(absolute)}
+    portable = []
+    for path in paths:
+        resolved = path.resolve()
+        try:
+            portable.append(resolved.relative_to(PROJECT_ROOT).as_posix())
+        except ValueError:
+            portable.append(str(resolved))
+    if len(portable) == 1:
+        return portable[0], "<image>"
+    value = {f"<image_{index:02d}>": path for index, path in enumerate(portable)}
     return value, "\n".join(value)
 
 

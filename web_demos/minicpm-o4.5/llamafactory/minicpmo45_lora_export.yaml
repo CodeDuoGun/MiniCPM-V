@@ -1,0 +1,10 @@
+model_name_or_path: openbmb/MiniCPM-o-4_5
+adapter_name_or_path: outputs/tcm_minicpmo45_lora
+template: minicpm_o
+trust_remote_code: true
+finetuning_type: lora
+export_dir: outputs/tcm_minicpmo45_lora_merged
+export_size: 5
+export_device: cpu
+export_legacy_format: false
+

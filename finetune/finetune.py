@@ -2,6 +2,7 @@ import glob
 import json
 import logging
 import os
+from pathlib import Path
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Dict, List, Optional, Union, Literal, Tuple
@@ -109,6 +110,7 @@ def make_supervised_data_module(
         query_nums=query_nums,
         batch_vision=batch_vision,
         max_length=max_length,
+        data_root=Path(data_args.data_path).resolve().parent,
     )
 
     if data_args.eval_data_path:
@@ -123,6 +125,7 @@ def make_supervised_data_module(
             query_nums=query_nums,
             batch_vision=batch_vision,
             max_length=max_length,
+            data_root=Path(data_args.eval_data_path).resolve().parent,
         )
     else:
         eval_dataset = None

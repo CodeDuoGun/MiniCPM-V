@@ -1,0 +1,21 @@
+# Hashing on uid keeps a patient on one model version for the whole consultation.
+split_clients "${ROLLOUT_SALT}${http_uid}" $minicpmo_backend {
+    ${ROLLOUT_PERCENT}%  minicpmo45;
+    *                   minicpmo26;
+}
+
+upstream minicpmo45 { server minicpmo45:32560; }
+upstream minicpmo26 { server minicpmo26:32550; }
+
+server {
+    listen 443 ssl;
+    location / {
+        proxy_pass http://$minicpmo_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header uid $http_uid;
+        proxy_read_timeout 900s;
+    }
+}
+

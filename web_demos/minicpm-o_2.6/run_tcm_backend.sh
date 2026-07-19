@@ -4,6 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# Export report-VLM settings before model_server.py parses os.environ.
+# Override ENV_FILE to use a deployment-specific secrets file.
+ENV_FILE="${ENV_FILE:-$PROJECT_DIR/.env}"
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
+
 MODEL="${MODEL:-openbmb/MiniCPM-o-2_6}"
 ADAPTER="${ADAPTER:-$PROJECT_DIR/outputs/tcm_minicpmo_lora_stage1_text}"
 PORT="${PORT:-32550}"

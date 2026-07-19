@@ -33,6 +33,12 @@ from realtime_video_policy import (
     document_likeness,
     is_manual_report_upload,
 )
+from slot_manager import (
+    DashScopeAudioTranscriber,
+    OpenAICompatibleSlotExtractor,
+    SlotConversation,
+    normalize_visit_type,
+)
 
 def setup_logger():
     logger = logging.getLogger("api_logger")
@@ -74,7 +80,38 @@ ap.add_argument('--human-service-url', type=str, default="http://127.0.0.1:8010/
 ap.add_argument('--report-vlm-base-url', type=str, default=os.getenv("REPORT_VLM_BASE_URL", ""), help="OpenAI-compatible VLM base URL for manual report uploads")
 ap.add_argument('--report-vlm-api-key', type=str, default=os.getenv("REPORT_VLM_API_KEY", ""), help="VLM API key; prefer REPORT_VLM_API_KEY")
 ap.add_argument('--report-vlm-model', type=str, default=os.getenv("REPORT_VLM_MODEL", ""), help="VLM model used only by the manual report-upload endpoint")
+ap.add_argument(
+    '--slot-config',
+    type=str,
+    default=os.getenv(
+        "SLOT_CONFIG",
+        os.path.abspath(os.path.join(cur_path, "../../data/slots/doctor_wuweiping.json")),
+    ),
+    help="initial/follow-up consultation slot configuration",
+)
+ap.add_argument('--slot-llm-base-url', type=str, default=os.getenv("SLOT_LLM_BASE_URL", os.getenv("REPORT_VLM_BASE_URL", "")), help="OpenAI-compatible slot extraction API base URL")
+ap.add_argument('--slot-llm-api-key', type=str, default=os.getenv("SLOT_LLM_API_KEY", os.getenv("REPORT_VLM_API_KEY", "")), help="slot extraction API key")
+ap.add_argument('--slot-llm-model', type=str, default=os.getenv("SLOT_LLM_MODEL", os.getenv("REPORT_VLM_MODEL", "")), help="text model used to extract consultation slots")
+ap.add_argument('--slot-history-turns', type=int, default=int(os.getenv("SLOT_HISTORY_TURNS", "12")), help="number of recent dialogue turns sent to the slot extractor")
+ap.add_argument('--slot-asr-api-key', type=str, default=os.getenv("SLOT_ASR_API_KEY", os.getenv("DASHSCOPE_API_KEY", "")), help="DashScope API key used to transcribe patient speech for slot extraction")
+ap.add_argument('--slot-asr-model', type=str, default=os.getenv("SLOT_ASR_MODEL", os.getenv("DASHSCOPE_ASR_REALTIME_MODEL", "paraformer-realtime-v2")), help="DashScope realtime ASR model")
+ap.add_argument('--slot-asr-ws-url', type=str, default=os.getenv("SLOT_ASR_WS_URL", os.getenv("DASHSCOPE_WS_URL", "")), help="optional DashScope websocket API URL")
+ap.add_argument('--slot-asr-vocabulary-id', type=str, default=os.getenv("SLOT_ASR_VOCABULARY_ID", os.getenv("DASHSCOPE_ASR_REALTIME_VOCAB_ID", "")), help="optional DashScope ASR vocabulary id")
 args = ap.parse_args()
+logger.info(
+    "Report VLM configuration: base_url=%s, model=%s, api_key_configured=%s",
+    args.report_vlm_base_url or "<未配置>",
+    args.report_vlm_model or "<未配置>",
+    bool(args.report_vlm_api_key),
+)
+logger.info(
+    "Slot configuration: file=%s, llm_model=%s, llm_configured=%s, asr_model=%s, asr_configured=%s",
+    args.slot_config,
+    args.slot_llm_model or "<未配置>",
+    bool(args.slot_llm_base_url and args.slot_llm_api_key and args.slot_llm_model),
+    args.slot_asr_model or "<未配置>",
+    bool(args.slot_asr_api_key and args.slot_asr_model),
+)
 
 TCM_SYSTEM_PROMPT = (
     "你是中医问诊助手，负责在初诊和复诊场景中进行真实、谨慎、连续的病情采集。"
@@ -296,6 +333,25 @@ class StreamManager:
         self.digital_human_session_id = None
         self.digital_human_msg_id = None
         self.digital_human_segment_index = 0
+
+        self.slot_lock = threading.RLock()
+        slot_extractor = OpenAICompatibleSlotExtractor(
+            base_url=args.slot_llm_base_url,
+            api_key=args.slot_llm_api_key,
+            model=args.slot_llm_model,
+        )
+        self.slot_conversation = SlotConversation(
+            config_path=args.slot_config,
+            extractor=slot_extractor if slot_extractor.configured else None,
+            history_turns=args.slot_history_turns,
+        )
+        self.slot_transcriber = DashScopeAudioTranscriber(
+            api_key=args.slot_asr_api_key,
+            model=args.slot_asr_model,
+            websocket_url=args.slot_asr_ws_url,
+            vocabulary_id=args.slot_asr_vocabulary_id,
+        )
+        self.pending_transcript = ""
         
         self.speaking_time_stamp = 0
         self.cycle_wait_time = 12800/24000 + 0.15
@@ -497,16 +553,36 @@ class StreamManager:
         # default 2.6 remote code may not. Re-anchor the vocoder when supported
         # without breaking deployments that still use the 2.6 API.
         if hasattr(self.minicpmo_model, "reset_session"):
-            self.minicpmo_model.reset_session(reset_token2wav_cache=True)
+            try:
+                self.minicpmo_model.reset_session(reset_token2wav_cache=True)
+            except TypeError:
+                # MiniCPM-o 2.6 only accepts reset_session() without kwargs.
+                logger.info("reset_session does not accept reset_token2wav_cache; using MiniCPM-o 2.6 API")
+                self.minicpmo_model.reset_session()
         if hasattr(self.minicpmo_model, "init_token2wav_cache"):
-            self.minicpmo_model.init_token2wav_cache(prompt_speech_16k=audio_prompt)
+            try:
+                self.minicpmo_model.init_token2wav_cache(prompt_speech_16k=audio_prompt)
+            except TypeError:
+                # MiniCPM-o 2.6 expects the reference waveform positionally.
+                logger.info("init_token2wav_cache does not accept prompt_speech_16k; using positional argument")
+                self.minicpmo_model.init_token2wav_cache(audio_prompt)
         if msg_type in (0, 2) or use_audio_prompt:
-            self.minicpmo_model.streaming_prefill(
-                session_id=str(self.session_id),
-                msgs=msgs,
-                tokenizer=self.minicpmo_tokenizer,
-                is_last_chunk=True,
-            )
+            try:
+                self.minicpmo_model.streaming_prefill(
+                    session_id=str(self.session_id),
+                    msgs=msgs,
+                    tokenizer=self.minicpmo_tokenizer,
+                    is_last_chunk=True,
+                )
+            except TypeError as exc:
+                if "is_last_chunk" not in str(exc):
+                    raise
+                logger.info("streaming_prefill does not accept is_last_chunk; using MiniCPM-o 2.6 API")
+                self.minicpmo_model.streaming_prefill(
+                    session_id=str(self.session_id),
+                    msgs=msgs,
+                    tokenizer=self.minicpmo_tokenizer,
+                )
             
         self.savedir = os.path.join(f"./log_data/{args.port}/", str(time.time()))
         if not os.path.exists(self.savedir):
@@ -538,6 +614,7 @@ class StreamManager:
             self.audio_input = []
             self.image_prefill = None
             self.report_frame_blocked = False
+            self.pending_transcript = ""
             
             if self.minicpmo_model.llm_past_key_values[0][0].shape[2]>8192:
                 self.session_id += 1  # to clear all kv cache
@@ -564,6 +641,22 @@ class StreamManager:
                 elif content_item["type"] == "input_audio":
                     audio_data = content_item["input_audio"]["data"]
                     audio_timestamp = content_item["input_audio"].get("timestamp", "")
+                    transcript = str(
+                        content_item["input_audio"].get("transcript")
+                        or content_item["input_audio"].get("text")
+                        or ""
+                    ).strip()
+                    if transcript:
+                        # 浏览器语音识别通常反复发送“当前完整句”，因此保留最新结果，
+                        # 不直接 append，避免形成“我我今天我今天头疼”。
+                        self.pending_transcript = transcript
+                elif content_item["type"] == "input_text":
+                    text_payload = content_item.get("input_text")
+                    if isinstance(text_payload, dict):
+                        text_payload = text_payload.get("text", "")
+                    transcript = str(text_payload or content_item.get("text") or "").strip()
+                    if transcript:
+                        self.pending_transcript = transcript
                 elif content_item["type"] == "image_data":
                     if content_item["image_data"].get("source", "realtime_video") != "realtime_video":
                         raise ValueError("stream image_data only accepts source=realtime_video")
@@ -730,6 +823,58 @@ class StreamManager:
             traceback.print_exc()
             raise
 
+    def _prepare_slot_turn_sync(self, input_audio_path: str) -> str:
+        """Transcribe the current patient turn, update slots, and build next prompt."""
+        transcript = self.pending_transcript.strip()
+        if not transcript and self.slot_transcriber.configured:
+            try:
+                audio_np, sample_rate = soundfile.read(
+                    input_audio_path, dtype="float32", always_2d=True
+                )
+                audio_np = np.mean(audio_np, axis=1)
+                if sample_rate != 16000:
+                    audio_np = librosa.resample(
+                        audio_np,
+                        orig_sr=sample_rate,
+                        target_sr=16000,
+                        res_type="kaiser_best",
+                    )
+                pcm_bytes = (
+                    np.clip(audio_np, -1.0, 1.0) * 32767.0
+                ).astype("<i2").tobytes()
+                transcript = self.slot_transcriber.transcribe_pcm(pcm_bytes, 16000)
+            except Exception as exc:
+                logger.warning("slot ASR failed; continue with historical slots: %s", exc)
+
+        with self.slot_lock:
+            changed = self.slot_conversation.process_user_turn(transcript)
+            context = self.slot_conversation.build_model_context()
+            extraction_error = self.slot_conversation.last_error
+        if transcript:
+            logger.info(
+                "slot turn=%s transcript_chars=%s changed=%s",
+                self.slot_conversation.turn_id,
+                len(transcript),
+                changed,
+            )
+        else:
+            logger.warning(
+                "No transcript for current patient turn. Configure SLOT_ASR_API_KEY "
+                "or include input_audio.transcript/input_text in the stream request."
+            )
+        if extraction_error:
+            logger.warning("slot extraction failed; previous state is preserved: %s", extraction_error)
+        return context
+
+    def _prefill_slot_context(self, context: str) -> None:
+        if not context:
+            return
+        self.minicpmo_model.streaming_prefill(
+            session_id=str(self.session_id),
+            msgs=[{"role": "user", "content": [context]}],
+            tokenizer=self.minicpmo_tokenizer,
+        )
+
     def generate_end(self):
         self.input_audio_id += 10
         self.output_audio_id += 10
@@ -744,6 +889,8 @@ class StreamManager:
             return
 
         self.flag_decode = True
+        response_text_parts = []
+        assistant_recorded = False
         try:
             with torch.no_grad():
                 logger.info("=== model gen start ===")
@@ -756,6 +903,13 @@ class StreamManager:
                         audio_stream = wav_file.read()
                 except FileNotFoundError:
                     print(f"File {input_audio_path} not found.")
+
+                # 在当前患者回答结束后、模型生成医生回复前完成：
+                # 语音转写 -> 结合历史抽取槽位 -> 把已收集/待收集槽位注入会话。
+                slot_context = await asyncio.to_thread(
+                    self._prepare_slot_turn_sync, input_audio_path
+                )
+                self._prefill_slot_context(slot_context)
                 yield base64.b64encode(audio_stream).decode('utf-8'), "assistant:\n", None
                 
                 print('=== gen start: ', time.time() - time_gen)
@@ -787,6 +941,8 @@ class StreamManager:
                                 self.generate_end()
                                 return
                             audio_np, sr, text = r["audio_wav"], r["sampling_rate"], r["text"]
+                            if text:
+                                response_text_parts.append(text)
 
                             output_audio_path = self.savedir + f'/output_audio_log/output_audio_{self.output_audio_id}.wav'
                             self.output_audio_id += 1
@@ -825,6 +981,11 @@ class StreamManager:
                             self.speaking_time_stamp += self.cycle_wait_time
                     except Exception as e:
                         logger.error(f"Error happened during generation: {str(e)}")
+                        raise
+                    if response_text_parts:
+                        with self.slot_lock:
+                            self.slot_conversation.record_assistant("".join(response_text_parts))
+                        assistant_recorded = True
                     yield None, '\n<end>', None
 
         except Exception as e:
@@ -835,6 +996,9 @@ class StreamManager:
 
         finally:
             logger.info(f"uid {self.uid}: generation finished!")
+            if response_text_parts and not assistant_recorded:
+                with self.slot_lock:
+                    self.slot_conversation.record_assistant("".join(response_text_parts))
             self.generate_end()
 
     async def check_activity(self):
@@ -873,6 +1037,11 @@ class StreamManager:
         if options is None:
             raise ValueError("Invalid None type for options, expected dict type")
         self.customized_options = options
+        with self.slot_lock:
+            self.slot_conversation.reset(
+                normalize_visit_type(options.get("visit_type")),
+                profile=options,
+            )
         logger.info(f"uid: {uid} set customized_options to {options}")
 
 
@@ -1050,16 +1219,22 @@ async def generate_sse_response(request: Request, uid: Optional[str] = Header(No
             async for audio, text, human_delivered in stream_manager.generate():
                 if text == "stop":
                     break
+                finished = bool(text and "<end>" in text)
+                slot_snapshot = None
+                if finished:
+                    with stream_manager.slot_lock:
+                        slot_snapshot = stream_manager.slot_conversation.snapshot()
                 res = {
                     "id": stream_manager.uid,
                     "response_id": stream_manager.output_audio_id,
+                    "slots": slot_snapshot,
                     "choices": [
                         {
                             "role": "assistant",
-                            "audio": audio,
+                            "audio": audio or "",
                             "text": text,
                             "digital_human_audio": human_delivered,
-                            "finish_reason": "processing"
+                            "finish_reason": "done" if finished else "processing"
                         }
                     ]
                 }
@@ -1069,9 +1244,31 @@ async def generate_sse_response(request: Request, uid: Optional[str] = Header(No
 
         except Exception as e:
             logger.error(f"Error while generation: {str(e)}")
-            yield f'data:{{"error": "{str(exc)}"}}\n\n'
+            error_res = {
+                "id": stream_manager.uid,
+                "error": str(e),
+                "choices": [{
+                    "role": "assistant",
+                    "audio": "",
+                    "text": "",
+                    "digital_human_audio": None,
+                    "finish_reason": "error",
+                }],
+            }
+            yield f"data: {json.dumps(error_res)}\n\n"
     except Exception as e:
-        yield f'data:{{"error": "{str(e)}"}}\n\n'
+        error_res = {
+            "id": stream_manager.uid,
+            "error": str(e),
+            "choices": [{
+                "role": "assistant",
+                "audio": "",
+                "text": "",
+                "digital_human_audio": None,
+                "finish_reason": "error",
+            }],
+        }
+        yield f"data: {json.dumps(error_res)}\n\n"
 
 @app.post("/completions")
 @app.post("/api/v1/completions")
@@ -1089,6 +1286,12 @@ async def completions(request: Request, uid: Optional[str] = Header(None)):
             stream_manager.session_id += 1
             stream_manager.sys_prompt_flag = False
             stream_manager.reset()
+            options = stream_manager.customized_options or {}
+            with stream_manager.slot_lock:
+                stream_manager.slot_conversation.reset(
+                    normalize_visit_type(options.get("visit_type")),
+                    profile=options,
+                )
 
             # raise HTTPException(
             #    status_code=409,
@@ -1177,6 +1380,16 @@ async def analyze_report_upload(request: Request, uid: Optional[str] = Header(No
         raise HTTPException(status_code=400, detail="Unsupported report image type")
     try:
         result = await asyncio.to_thread(analyze_manually_uploaded_report, image_data, mime_type)
+        with stream_manager.slot_lock:
+            stream_manager.slot_conversation.set_signal("report_uploaded", True)
+            stream_manager.slot_conversation.set_external_value(
+                "exam_report", "已通过手动入口上传", "患者手动上传检查报告"
+            )
+            analysis_summary = str(result.get("summary") or "").strip()
+            if analysis_summary:
+                stream_manager.slot_conversation.set_external_value(
+                    "exam_analysis", analysis_summary, "独立检查报告 VLM 分析"
+                )
         return JSONResponse(
             content={
                 "id": uid,
@@ -1302,6 +1515,58 @@ async def init_options(request: Request, uid: Optional[str] = Header(None)):
         return JSONResponse(content=response, status_code=200)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"init options error: {str(e)}")
+
+
+@app.get("/api/v1/slots")
+async def get_consultation_slots(uid: Optional[str] = Header(None)):
+    """Return the current initial/follow-up slot state for UI/debugging."""
+    if not uid:
+        raise HTTPException(status_code=400, detail="Missing uid in headers")
+    if stream_manager.uid is not None and stream_manager.uid != uid:
+        raise HTTPException(status_code=409, detail="UID does not own the current session")
+    with stream_manager.slot_lock:
+        return JSONResponse(content=stream_manager.slot_conversation.snapshot())
+
+
+@app.post("/api/v1/slots/update")
+async def update_consultation_slots(request: Request, uid: Optional[str] = Header(None)):
+    """Allow an upstream ASR or text client to update the same slot state."""
+    if not uid:
+        raise HTTPException(status_code=400, detail="Missing uid in headers")
+    payload = await request.json()
+    transcript = str(payload.get("transcript") or payload.get("input_text") or "").strip()
+    updates = payload.get("updates") or []
+    assistant_text = str(payload.get("assistant_text") or "").strip()
+    if not transcript and not updates and not assistant_text:
+        raise HTTPException(status_code=400, detail="transcript, updates or assistant_text is required")
+
+    def _update():
+        with stream_manager.slot_lock:
+            if transcript:
+                stream_manager.slot_conversation.process_user_turn(transcript)
+            if isinstance(updates, list):
+                stream_manager.slot_conversation.apply_updates(updates, source="api")
+            if assistant_text:
+                stream_manager.slot_conversation.record_assistant(assistant_text)
+            return stream_manager.slot_conversation.snapshot()
+
+    snapshot = await asyncio.to_thread(_update)
+    return JSONResponse(content=snapshot)
+
+
+@app.post("/api/v1/slots/reset")
+async def reset_consultation_slots(request: Request, uid: Optional[str] = Header(None)):
+    if not uid:
+        raise HTTPException(status_code=400, detail="Missing uid in headers")
+    payload = await request.json()
+    profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
+    if "visit_type" in payload:
+        profile["visit_type"] = payload["visit_type"]
+    visit_type = normalize_visit_type(profile.get("visit_type"))
+    with stream_manager.slot_lock:
+        stream_manager.slot_conversation.reset(visit_type, profile=profile)
+        snapshot = stream_manager.slot_conversation.snapshot()
+    return JSONResponse(content=snapshot)
 
 
 @app.get('/health')

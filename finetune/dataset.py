@@ -5,6 +5,7 @@ import math
 import os
 import re
 import random
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -34,6 +35,7 @@ class SupervisedDataset(Dataset):
         query_nums=64,
         batch_vision=False,
         max_length=2048,
+        data_root=None,
     ):
         super(SupervisedDataset, self).__init__()
         self.raw_data = raw_data
@@ -45,6 +47,67 @@ class SupervisedDataset(Dataset):
         self.query_nums=query_nums
         self.batch_vision = batch_vision
         self.max_length = max_length
+        self.data_root = Path(data_root).resolve() if data_root else Path.cwd()
+        self.project_root = Path(__file__).resolve().parents[1]
+        self._normalize_and_validate_image_paths()
+
+    def _resolve_image_path(self, image_path):
+        """Resolve portable paths and relocate paths created in another checkout."""
+        original = Path(image_path).expanduser()
+        candidates = [original]
+        if not original.is_absolute():
+            candidates.extend((self.data_root / original, self.project_root / original))
+        else:
+            parts = original.parts
+            project_name = self.project_root.name
+            if project_name in parts:
+                project_index = parts.index(project_name)
+                candidates.append(self.project_root.joinpath(*parts[project_index + 1:]))
+            if "data" in parts:
+                data_index = parts.index("data")
+                candidates.append(self.project_root.joinpath(*parts[data_index:]))
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate.resolve())
+        checked = ", ".join(str(path) for path in dict.fromkeys(candidates))
+        raise FileNotFoundError(f"Image file not found. Source={image_path}; checked={checked}")
+
+    def _normalize_and_validate_image_paths(self):
+        """Resolve every image once and fail before the training loop starts."""
+        resolved_cache = {}
+        errors = []
+        for index, sample in enumerate(self.raw_data):
+            image_data = sample.get("image") if isinstance(sample, dict) else None
+            if not image_data:
+                continue
+            if isinstance(image_data, str):
+                paths = [image_data]
+            elif isinstance(image_data, dict):
+                paths = list(image_data.values())
+            else:
+                errors.append(
+                    f"index={index}, id={sample.get('id', index)}: unsupported image value {type(image_data)}"
+                )
+                continue
+            try:
+                resolved = []
+                for path in paths:
+                    if path not in resolved_cache:
+                        resolved_cache[path] = self._resolve_image_path(path)
+                    resolved.append(resolved_cache[path])
+                if isinstance(image_data, str):
+                    sample["image"] = resolved[0]
+                else:
+                    sample["image"] = dict(zip(image_data.keys(), resolved))
+            except (OSError, TypeError, ValueError) as exc:
+                errors.append(f"index={index}, id={sample.get('id', index)}: {exc}")
+        if errors:
+            preview = "\n".join(errors[:10])
+            suffix = f"\n... and {len(errors) - 10} more" if len(errors) > 10 else ""
+            raise FileNotFoundError(
+                f"Dataset image preflight failed for {len(errors)} sample(s):\n{preview}{suffix}"
+            )
 
     def __len__(self):
         return len(self.raw_data)

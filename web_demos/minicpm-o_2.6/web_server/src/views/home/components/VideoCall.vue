@@ -636,15 +636,25 @@
             },
             onmessage(msg) {
                 const data = JSON.parse(msg.data);
+                const choice = data.choices?.[0];
+                if (!choice || choice.finish_reason === 'error' || data.error) {
+                    console.error('模型生成失败:', data.error || '返回数据格式不正确');
+                    isReturnError.value = true;
+                    isEnd.value = true;
+                    ElMessage.error(data.error || '模型生成失败，请稍后重试');
+                    ctrl.abort();
+                    return;
+                }
+                const finished = choice.finish_reason === 'done' || choice.text?.includes('<end>');
                 if (data.response_id) {
                     curResponseId.value = data.response_id;
                 }
-                if (data.choices[0]?.digital_human_audio === false) {
+                if (choice.digital_human_audio === false) {
                     console.warn('数字人音频注入失败，本段回退为浏览器原始音频播放');
                     digitalHumanReady.value = false;
                 }
-                if (data.choices[0]?.text) {
-                    textQueue.value += data.choices[0].text.replace('<end>', '');
+                if (choice.text) {
+                    textQueue.value += choice.text.replace('<end>', '');
                     console.warn('text return time -------------------------------', +new Date());
                 }
                 // 首次返回的是前端发给后端的音频片段，需要单独处理
@@ -652,13 +662,17 @@
                     console.log('第一次');
                     isFirstReturn.value = false;
                     // 如果后端返回的音频为空，需要重连
-                    if (!data.choices[0].audio) {
+                    if (!choice.audio) {
+                        if (finished) {
+                            isEnd.value = true;
+                            return;
+                        }
                         buildConnect();
                         return;
                     }
                     outputData.value.push({
                         type: 'USER',
-                        audio: `data:audio/wav;base64,${data.choices[0].audio}`
+                        audio: `data:audio/wav;base64,${choice.audio}`
                     });
                     outputData.value.push({
                         type: 'BOT',
@@ -667,20 +681,20 @@
                     });
                     return;
                 }
-                if (data.choices[0]?.audio) {
+                if (choice.audio) {
                     console.log('audio return time -------------------------------', +new Date());
                     if (!getStopValue() && isCalling.value) {
                         skipDisabled.value = false;
-                        base64List.value.push(`data:audio/wav;base64,${data.choices[0].audio}`);
-                        addAudioQueue(() => truePlay(data.choices[0].audio));
+                        base64List.value.push(`data:audio/wav;base64,${choice.audio}`);
+                        addAudioQueue(() => truePlay(choice.audio));
                     }
-                    allVoice.value.push(`data:audio/wav;base64,${data.choices[0].audio}`);
-                } else {
+                    allVoice.value.push(`data:audio/wav;base64,${choice.audio}`);
+                } else if (!finished) {
                     // 发生异常了，直接重连
                     buildConnect();
                 }
-                if (data.choices[0].text.includes('<end>')) {
-                    // isEnd.value = true;
+                if (finished) {
+                    isEnd.value = true;
                     console.log('收到结束标记了:', +new Date());
                     if (
                         outputData.value[outputData.value.length - 1]?.type === 'BOT' &&
@@ -870,9 +884,10 @@
         const item = taskQueue.value.shift();
         if (item?.func) {
             item.func()
-                .then(res => {
-                    console.log('已处理事件: ', res);
+                .then(() => {
+                    console.log('队列任务处理完成');
                 })
+                .catch(error => console.error('队列任务处理失败:', error))
                 .finally(() => processQueue());
         } else {
             running.value = false;
