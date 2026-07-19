@@ -16,7 +16,10 @@ lora_dropout: 0.05
 dataset_dir: web_demos/minicpm-o4.5/llamafactory
 dataset: tcm_o45_train
 eval_dataset: tcm_o45_validation
-template: minicpm_o
+# Image/text-only SFT should not use `minicpm_o` here: that template declares
+# an audio token, and LLaMA-Factory then requires an audio feature extractor
+# even when the dataset has no audio column.
+template: minicpm_v
 cutoff_len: 8192
 overwrite_cache: true
 preprocessing_num_workers: 8
@@ -30,7 +33,7 @@ save_steps: 50
 plot_loss: true
 overwrite_output_dir: false
 save_total_limit: 3
-report_to: tensorboard
+report_to: none
 
 ### train
 per_device_train_batch_size: 1
@@ -42,10 +45,10 @@ lr_scheduler_type: cosine
 warmup_ratio: 0.03
 bf16: true
 gradient_checkpointing: true
+use_reentrant_gc: false
 ddp_timeout: 180000000
 save_only_model: true
 
 ### eval
 eval_strategy: steps
 prediction_loss_only: true
-

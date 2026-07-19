@@ -106,6 +106,10 @@ SYMPTOMS = (
     "疼痛", "肿胀", "脱屑", "干燥", "渗液", "破溃", "色沉", "色斑", "痘印", "痘坑", "脱发",
 )
 CLINICAL_TYPES = {"tongue", "lesion", "face_overview"}
+CLINICAL_SOURCE_FIELDS = {"tongue_face_img", "admin_face_img"}
+REPORT_SOURCE_FIELDS = {"admin_report_img"}
+SOURCE_FIELDS = tuple(sorted(CLINICAL_SOURCE_FIELDS | REPORT_SOURCE_FIELDS))
+DEFAULT_LEGACY_DOWNLOAD_DIR = PROJECT_ROOT / "web_demos/minicpm-o4.5/data/downloaded_images"
 
 CLINICAL_PROMPT = """你是医学图片标注助手，只描述真实可见内容，禁止诊断、辨证、推测病因或推荐药物。
 图片来自一个同时存放舌面和患处照片的字段。请先分类，再结构化描述。看不清时使用“未知”。
@@ -260,6 +264,37 @@ def image_suffix(url: str) -> str:
     return suffix if suffix in {".jpg", ".jpeg", ".png", ".webp", ".bmp"} else ".jpg"
 
 
+def legacy_download_candidates(cache_dir: Path, url: str) -> list[Path]:
+    target = cache_dir / (hash_id(url) + image_suffix(url))
+    return [target] + sorted(target.parent.glob(target.name + ".*"))
+
+
+def normalized_image_path(output: Path, image_id: str) -> Path:
+    return output / "normalized_images" / f"{image_id}.jpg"
+
+
+def ensure_train_safe_image(source: Path, target: Path, max_side: int, max_pixels: int) -> bool:
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise RuntimeError("normalize 阶段需要 Pillow") from exc
+    try:
+        Image.MAX_IMAGE_PIXELS = None
+        with Image.open(source) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return False
+            if width * height <= max_pixels and max(width, height) <= max_side:
+                return False
+            image = image.convert("RGB")
+            image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            image.save(target, format="JPEG", quality=92, optimize=True)
+            return True
+    except Exception:
+        return False
+
+
 def load_jsonl_index(path: Path, key: str = "image_id") -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     if not path.is_file():
@@ -381,7 +416,7 @@ def normalize_analysis(raw: dict[str, Any], entry: dict[str, Any]) -> dict[str, 
         "source_field": entry["source_field"],
         "model_output_version": 1,
     }
-    if entry["source_field"] == "tongue_face_img":
+    if entry["source_field"] in CLINICAL_SOURCE_FIELDS:
         image_type = raw.get("image_type") if raw.get("image_type") in CLINICAL_TYPES | {"invalid"} else "invalid"
         description = clean_text(raw.get("description") or "图像特征不清，无法可靠描述。", 180)
         if re.search(r"诊断|考虑|疑似|符合|癌|痤疮|湿疹|皮炎|银屑病", description):
@@ -445,13 +480,15 @@ def command_prepare(args: argparse.Namespace) -> None:
     dialogues = read_json(args.dialogues)
     best_dialogues: dict[str, dict[str, Any]] = {}
     for item in dialogues:
-        rid = str(item.get("id"))
+        rid = str(item.get("id") or item.get("record_id"))
         pairs = minicpmo_dialogue_pairs(item)
+        if not pairs:
+            pairs = dialogue_pairs(item.get("cleared_data", {}).get("dialogue"))
         current_pairs = best_dialogues.get(rid, {}).get("pairs", [])
         if len(pairs) > len(current_pairs):
             best_dialogues[rid] = {
                 "pairs": pairs,
-                "visit_type": minicpmo_visit_type(item),
+                "visit_type": minicpmo_visit_type(item) or clean_text(item.get("is_first"), 8),
             }
     matched_ids = set(best_dialogues)
     entries: dict[tuple[str, str], dict[str, Any]] = {}
@@ -472,7 +509,7 @@ def command_prepare(args: argparse.Namespace) -> None:
                 "dialogue_source": str(args.dialogues.resolve()),
             }
         )
-        for field in ("tongue_face_img", "admin_report_img"):
+        for field in SOURCE_FIELDS:
             for order, image in enumerate(record.get(field) or []):
                 url = image.get("img") if isinstance(image, dict) else image
                 if not isinstance(url, str) or not url.startswith(("http://", "https://")):
@@ -480,13 +517,14 @@ def command_prepare(args: argparse.Namespace) -> None:
                 key = (url, field)
                 if key not in entries:
                     image_id = hash_id(f"{field}:{url}")
-                    subdir = "clinical_original" if field == "tongue_face_img" else "report_original"
+                    subdir = "clinical_original" if field in CLINICAL_SOURCE_FIELDS else "report_original"
                     entries[key] = {
                         "image_id": image_id,
                         "source_field": field,
                         "url": url,
                         "local_path": f"{subdir}/{image_id}{image_suffix(url)}",
-                        "redacted_path": f"report_redacted/{image_id}.png" if field == "admin_report_img" else None,
+                        "normalized_path": f"normalized_images/{image_id}.jpg",
+                        "redacted_path": f"report_redacted/{image_id}.png" if field in REPORT_SOURCE_FIELDS else None,
                         "occurrences": [],
                     }
                 entries[key]["occurrences"].append(
@@ -518,20 +556,57 @@ def command_download(args: argparse.Namespace) -> None:
     config_path = output / "download_images.curl.conf"
     if not config_path.is_file():
         raise SystemExit("请先运行 prepare")
-    if args.max_images or args.source_field:
-        manifest = read_json(output / "image_manifest.private.json")
-        selected = [item for item in manifest if not args.source_field or item["source_field"] == args.source_field]
-        if args.max_images:
-            selected = selected[: args.max_images]
-        for item in selected:
-            target = output / item["local_path"]
-            if is_complete_image(target):
-                continue
-            target.parent.mkdir(parents=True, exist_ok=True)
+    manifest = read_json(output / "image_manifest.private.json")
+    selected = [item for item in manifest if not args.source_field or item["source_field"] == args.source_field]
+    if args.dataset:
+        required_ids = set()
+        for dataset_path in args.dataset:
+            for sample in read_json(dataset_path):
+                required_ids.update(Path(str(path)).stem for path in sample.get("images") or [])
+        selected = [item for item in selected if item["image_id"] in required_ids]
+        manifest_ids = {item["image_id"] for item in manifest}
+        missing_manifest_ids = sorted(required_ids - manifest_ids)
+        if missing_manifest_ids:
+            raise SystemExit(
+                "训练数据中的图片未出现在 manifest: " + ", ".join(missing_manifest_ids[:20])
+            )
+    if args.max_images:
+        selected = selected[: args.max_images]
+    copied = skipped = downloaded = missing = 0
+    for item in selected:
+        target = output / item["local_path"]
+        if is_complete_image(target, decode_pixels=True):
+            skipped += 1
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        copied_from_cache = False
+        if args.cache_dir:
+            for candidate in legacy_download_candidates(Path(args.cache_dir), item["url"]):
+                if is_complete_image(candidate, decode_pixels=True):
+                    shutil.copy2(candidate, target)
+                    copied += 1
+                    copied_from_cache = True
+                    break
+        if copied_from_cache:
+            continue
+        if args.offline_cache_only:
+            missing += 1
+            continue
+        partial = target.with_suffix(target.suffix + ".part")
+        partial.unlink(missing_ok=True)
+        try:
             subprocess.run(
-                ["curl", "-L", "--fail", "--retry", "3", "--connect-timeout", "20", "--output", str(target), item["url"]],
+                ["curl", "-L", "--fail", "--retry", "3", "--connect-timeout", "20", "--output", str(partial), item["url"]],
                 check=True,
             )
+            if not is_complete_image(partial, decode_pixels=True):
+                raise RuntimeError(f"下载后的图片仍不完整: {item['image_id']} {item['url']}")
+            partial.replace(target)
+        finally:
+            partial.unlink(missing_ok=True)
+        downloaded += 1
+    if args.max_images or args.source_field or args.cache_dir or args.offline_cache_only:
+        print(json.dumps({"selected": len(selected), "skipped": skipped, "copied": copied, "downloaded": downloaded, "missing": missing}, ensure_ascii=False))
         return
     subprocess.run(["curl", "-L", "--fail", "--config", str(config_path)], cwd=output, check=True)
 
@@ -571,7 +646,7 @@ def command_analyze(args: argparse.Namespace) -> None:
     client, model = make_client(args)
 
     def worker(entry: dict[str, Any]) -> dict[str, Any]:
-        prompt = CLINICAL_PROMPT if entry["source_field"] == "tongue_face_img" else REPORT_PROMPT
+        prompt = CLINICAL_PROMPT if entry["source_field"] in CLINICAL_SOURCE_FIELDS else REPORT_PROMPT
         raw = vlm_call(client, model, entry["url"], prompt, args.attempts)
         result = normalize_analysis(raw, entry)
         result["model"] = model
@@ -661,6 +736,37 @@ def command_verify(args: argparse.Namespace) -> None:
 
     succeeded, failed = run_concurrent(pending, args.workers, worker, cache_path)
     print(json.dumps({"cached": len(done), "attempted": len(pending), "succeeded": succeeded, "failed": failed}, ensure_ascii=False))
+
+
+def command_normalize(args: argparse.Namespace) -> None:
+    output = Path(args.output_dir)
+    manifest = read_json(output / "image_manifest.private.json")
+    selected = [item for item in manifest if not args.source_field or item["source_field"] == args.source_field]
+    if args.dataset:
+        required_ids = set()
+        for dataset_path in args.dataset:
+            for sample in read_json(dataset_path):
+                required_ids.update(Path(str(path)).stem for path in sample.get("images") or [])
+        selected = [item for item in selected if item["image_id"] in required_ids]
+    stats = Counter()
+    for item in selected:
+        if item["source_field"] not in CLINICAL_SOURCE_FIELDS:
+            stats["skipped_non_clinical"] += 1
+            continue
+        source = output / item["local_path"]
+        if not is_complete_image(source, decode_pixels=True):
+            stats["missing_or_incomplete"] += 1
+            continue
+        target = output / item.get("normalized_path", f"normalized_images/{item['image_id']}.jpg")
+        if target.is_file() and is_complete_image(target, decode_pixels=True):
+            stats["already_normalized"] += 1
+            continue
+        target.unlink(missing_ok=True)
+        if ensure_train_safe_image(source, target, args.max_image_side, args.max_image_pixels):
+            stats["normalized"] += 1
+        else:
+            stats["kept_original"] += 1
+    print(json.dumps(dict(stats), ensure_ascii=False, indent=2))
 
 
 def patient_components(records: dict[str, dict[str, Any]], manifest: list[dict[str, Any]]) -> dict[str, str]:
@@ -947,8 +1053,9 @@ def command_build(args: argparse.Namespace) -> None:
         entry = entries.get(image_id)
         if not entry or analysis.get("quality") == "unusable":
             continue
-        if entry["source_field"] == "tongue_face_img":
-            path = output / entry["local_path"]
+        if entry["source_field"] in CLINICAL_SOURCE_FIELDS:
+            normalized = output / entry.get("normalized_path", "")
+            path = normalized if normalized.is_file() else output / entry["local_path"]
             if analysis.get("image_type") not in CLINICAL_TYPES or not is_complete_image(path):
                 continue
             target = clinical_by_record
@@ -1054,15 +1161,23 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--dialogues", type=Path, default=DEFAULT_DIALOGUES)
 
     download = subparsers.add_parser("download")
-    download.add_argument("--source-field", choices=["tongue_face_img", "admin_report_img"], default=None)
+    download.add_argument("--source-field", choices=SOURCE_FIELDS, default=None)
+    download.add_argument("--dataset", type=Path, action="append", default=[])
     download.add_argument("--max-images", type=int, default=0)
+    download.add_argument("--cache-dir", type=Path, default=DEFAULT_LEGACY_DOWNLOAD_DIR)
+    download.add_argument("--offline-cache-only", action="store_true")
     analyze = subparsers.add_parser("analyze")
     add_common_api_args(analyze)
-    analyze.add_argument("--source-field", choices=["tongue_face_img", "admin_report_img"], default=None)
+    analyze.add_argument("--source-field", choices=SOURCE_FIELDS, default=None)
     redact = subparsers.add_parser("redact")
     redact.add_argument("--header-redact-ratio", type=float, default=0.24)
     verify = subparsers.add_parser("verify")
     add_common_api_args(verify)
+    normalize = subparsers.add_parser("normalize")
+    normalize.add_argument("--source-field", choices=SOURCE_FIELDS, default=None)
+    normalize.add_argument("--dataset", type=Path, action="append", default=[])
+    normalize.add_argument("--max-image-side", type=int, default=4096)
+    normalize.add_argument("--max-image-pixels", type=int, default=50_000_000)
     build = subparsers.add_parser("build")
     build.add_argument("--seed", default="20260715")
     build.add_argument("--max-clinical-group", type=int, default=4)
@@ -1081,6 +1196,7 @@ def main() -> None:
         "analyze": command_analyze,
         "redact": command_redact,
         "verify": command_verify,
+        "normalize": command_normalize,
         "build": command_build,
     }
     commands[args.command](args)
