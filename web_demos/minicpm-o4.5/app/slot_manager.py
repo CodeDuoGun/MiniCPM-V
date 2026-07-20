@@ -471,7 +471,7 @@ class SlotConversation:
                 evidence=str(item.get("evidence") or "Redis恢复")[:300],
                 confidence=float(item.get("confidence", 1.0)),
                 updated_turn=int(item.get("updated_turn", 0)),
-                source=str(item.get("source") or "redis"),
+                source=str(item.get("source") or "local_store"),
             )
         self.signals = dict(snapshot.get("signals") or {})
         self.history = [dict(item) for item in (snapshot.get("history") or []) if isinstance(item, Mapping)]

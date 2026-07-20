@@ -141,11 +141,10 @@
         return new Promise(resolve => setTimeout(resolve, ms));
     };
     const initRecording = async () => {
+        // Keep init_options, stream and completions on one session UID.
+        setNewUserId();
         uploadUserConfig()
             .then(async () => {
-                // 每次call都需要生成新uid
-                setNewUserId();
-
                 outputData.value = [];
                 buildConnect();
                 isCalling.value = true;

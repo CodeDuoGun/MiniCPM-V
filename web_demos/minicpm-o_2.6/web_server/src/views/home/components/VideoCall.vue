@@ -249,6 +249,9 @@
         }
     };
     const initRecording = async () => {
+        // The backend binds its single duplex session to the UID used during
+        // init_options, so generate the call UID before uploading configuration.
+        setNewUserId();
         uploadUserConfig()
             .then(async () => {
                 if (!audioDOM) {
@@ -256,8 +259,6 @@
                     audioDOM.playsinline = true;
                     audioDOM.preload = 'auto';
                 }
-                // 每次call都需要生成新uid
-                setNewUserId();
                 await initVideoStream('environment');
                 if (digitalHumanEnabled.value) {
                     await initDigitalHuman();

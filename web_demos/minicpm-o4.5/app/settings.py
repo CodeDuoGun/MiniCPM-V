@@ -42,9 +42,8 @@ class Settings:
     vision_vlm_api_key: str = ""
     vision_vlm_model: str = ""
 
-    redis_url: str = ""
-    redis_key_prefix: str = "minicpmo45:consultation"
-    consultation_ttl_seconds: int = 604800
+    consultation_store_dir: str = "web_demos/minicpm-o4.5/runtime_data/consultations"
+    consultation_ttl_seconds: int = 0
 
     qiniu_access_key: str = ""
     qiniu_secret_key: str = ""
@@ -88,6 +87,10 @@ class Settings:
     @property
     def log_root_path(self) -> Path:
         return self.project_path(self.log_root)
+
+    @property
+    def consultation_store_path(self) -> Path:
+        return self.project_path(self.consultation_store_dir)
 
 
 settings = Settings.from_env()

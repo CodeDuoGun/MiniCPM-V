@@ -92,16 +92,19 @@ Content-Type: application/json
 VLM 质控；质控通过后才执行结构化分析并写入病情槽位。质控不通过的图片和质控结论仍会保存，
 但不会进入模型后续问诊上下文。检查报告必须使用该显式上传接口，不允许从实时视频帧读取。
 
-图片经 `utils/qiniu_lib.py` 上传，Redis 按
-`<REDIS_KEY_PREFIX>:<consultation_id>` 保存患者基本信息、槽位病情、对话、图片 HTTP 地址、
-质控结果和分析结果。可通过以下接口查询完整记录：
+图片经 `utils/qiniu_lib.py` 上传。患者基本信息、槽位病情、对话、图片 HTTP 地址、质控结果和
+分析结果按问诊保存为本地 JSON 文件，默认目录为
+`web_demos/minicpm-o4.5/runtime_data/consultations/`。服务重启后会从该目录恢复记录，也可通过
+以下接口查询完整记录：
 
 ```http
 GET /api/v1/consultations/{consultation_id}
 uid: patient-or-session-id
 ```
 
-生产环境必须配置 `VISION_VLM_*`、`REDIS_URL` 和 `QINIU_*`；密钥只放环境变量，不写入仓库。
+`CONSULTATION_STORE_DIR` 可修改保存目录，`CONSULTATION_TTL_SECONDS=0` 表示永久保留。
+生产环境必须配置 `VISION_VLM_*` 和 `QINIU_*`；密钥只放环境变量，不写入仓库。本地目录包含
+患者数据，应限制为服务账号可读写并纳入加密备份和清理策略。
 
 ## 4. LLaMA-Factory 数据与 LoRA
 

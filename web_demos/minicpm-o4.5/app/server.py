@@ -254,7 +254,7 @@ async def health() -> dict[str, Any]:
         "status": "OK",
         **runtime.capabilities(),
         "integrations": {
-            "redis": consultation_store.configured,
+            "local_store": consultation_store.configured,
             "qiniu": image_storage.configured,
             "vision_vlm": image_analyzer.configured,
         },
@@ -447,7 +447,7 @@ async def analyze_consultation_image(request: Request, uid: str | None = Header(
     if session.started and session.consultation_id and consultation_id != session.consultation_id:
         raise HTTPException(status_code=409, detail="consultation_id does not match the active session")
     if not consultation_store.configured:
-        raise HTTPException(status_code=503, detail="consultation Redis is not configured")
+        raise HTTPException(status_code=503, detail="local consultation store is not configured")
     if not image_storage.configured:
         raise HTTPException(status_code=503, detail="Qiniu image storage is not configured")
     if not image_analyzer.configured:

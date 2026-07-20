@@ -60,23 +60,9 @@ def test_visual_analysis_updates_condition_and_next_request():
     assert "舌体淡红" in context.build_prompt()
 
 
-class FakeRedis:
-    def __init__(self):
-        self.values = {}
-
-    def get(self, key):
-        return self.values.get(key)
-
-    def setex(self, key, _ttl, value):
-        self.values[key] = value
-
-    def set(self, key, value):
-        self.values[key] = value
-
-
-def test_redis_document_keeps_images_when_context_is_refreshed():
-    store = ConsultationStore(Settings(load_model=False))
-    store.client = FakeRedis()
+def test_local_document_keeps_images_when_context_is_refreshed(tmp_path):
+    config = Settings(load_model=False, consultation_store_dir=str(tmp_path))
+    store = ConsultationStore(config)
     snapshot = {
         "visit_type": "初诊",
         "turn_id": 1,
@@ -92,6 +78,8 @@ def test_redis_document_keeps_images_when_context_is_refreshed():
     assert restored["patient"]["patient_age"] == 30
     assert restored["conversation"][0]["content"] == "失眠"
     assert restored["images"][0]["status"] == "quality_rejected"
+    assert len(list(tmp_path.glob("*.json"))) == 1
+    assert ConsultationStore(config).get("consultation-1") == restored
 
 
 class FakeImageStorage:
@@ -121,9 +109,8 @@ def image_b64():
     return base64.b64encode(output.getvalue()).decode()
 
 
-def test_image_endpoint_runs_quality_analysis_and_persists(monkeypatch):
-    store = ConsultationStore(Settings(load_model=False))
-    store.client = FakeRedis()
+def test_image_endpoint_runs_quality_analysis_and_persists(monkeypatch, tmp_path):
+    store = ConsultationStore(Settings(load_model=False, consultation_store_dir=str(tmp_path)))
     monkeypatch.setattr(server, "consultation_store", store)
     monkeypatch.setattr(server, "image_storage", FakeImageStorage())
     monkeypatch.setattr(server, "image_analyzer", FakeAnalyzer())

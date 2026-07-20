@@ -1,8 +1,8 @@
 .env
 runtime_logs/
+runtime_data/
 **/__pycache__/
 *.py[cod]
 evaluation/cases.jsonl
 evaluation/predictions.jsonl
 evaluation/report.json
-
