@@ -1,14 +1,19 @@
 # MiniCPM-o 4.5 has only been validated with this Transformers release.
+# librosa==0.9.0 still imports pkg_resources. Setuptools 82 removed that module.
+setuptools==80.9.0
 transformers==4.51.0
-torch>=2.3.0,<=2.8.0
-torchaudio<=2.8.0
-torchvision
+# These three packages are one ABI-locked stack. Install them from the same
+# official PyTorch CUDA index (cu126 or cu128) before the remaining packages.
+torch==2.8.0
+torchaudio==2.8.0
+torchvision==0.23.0
 accelerate
 minicpmo-utils[all]>=1.0.5
 Pillow>=10.1.0
-numpy
+# minicpmo-utils 1.0.5/1.0.6 pins librosa==0.9.0, which is not compatible
+# with NumPy 2.x. Let minicpmo-utils install librosa and keep NumPy on 1.x.
+numpy>=1.24,<2
 soundfile>=0.12.1
-librosa>=0.10.2
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9

@@ -3,16 +3,57 @@ from __future__ import annotations
 import inspect
 import logging
 import threading
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
-import librosa
 import numpy as np
+import soundfile as sf
 
 from .settings import Settings
 
 
 logger = logging.getLogger(__name__)
+
+
+def validate_torch_stack() -> dict[str, str]:
+    expected = {"torch": "2.8.0", "torchaudio": "2.8.0", "torchvision": "0.23.0"}
+    installed: dict[str, str] = {}
+    for package, wanted in expected.items():
+        try:
+            installed[package] = version(package)
+        except PackageNotFoundError as exc:
+            raise RuntimeError(f"missing required package: {package}=={wanted}") from exc
+        if installed[package].split("+")[0] != wanted:
+            raise RuntimeError(
+                f"incompatible PyTorch stack: expected {package}=={wanted}, "
+                f"found {installed[package]}. Reinstall torch/torchvision/torchaudio "
+                "together from the same official PyTorch CUDA index."
+            )
+    try:
+        import torch
+        import torchaudio
+    except (ImportError, OSError) as exc:
+        raise RuntimeError(
+            f"PyTorch/TorchAudio binary ABI check failed: {exc}. Reinstall all three "
+            "packages together from the same CUDA wheel index."
+        ) from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is unavailable; MiniCPM-o 4.5 full inference requires an NVIDIA GPU")
+    installed["torch_cuda"] = str(torch.version.cuda)
+    installed["gpu"] = torch.cuda.get_device_name(0)
+    return installed
+
+
+def _load_reference_audio(path: Path) -> np.ndarray:
+    audio, sample_rate = sf.read(path, dtype="float32", always_2d=True)
+    audio = np.mean(audio, axis=1)
+    if sample_rate != 16000:
+        output_size = max(1, round(len(audio) * 16000 / sample_rate))
+        source_positions = np.linspace(0.0, 1.0, num=len(audio), endpoint=False)
+        target_positions = np.linspace(0.0, 1.0, num=output_size, endpoint=False)
+        audio = np.interp(target_positions, source_positions, audio)
+    return np.ascontiguousarray(audio, dtype=np.float32)
 
 
 class MiniCPMO45Runtime:
@@ -36,6 +77,8 @@ class MiniCPMO45Runtime:
         import torch
         from transformers import AutoModel
 
+        stack = validate_torch_stack()
+        logger.info("validated PyTorch stack: %s", stack)
         dtype = getattr(torch, self.config.torch_dtype)
         logger.info("loading %s on %s", self.config.model_id, self.config.device)
         model = AutoModel.from_pretrained(
@@ -59,7 +102,7 @@ class MiniCPMO45Runtime:
         self.model = model.as_duplex() if self.config.model_mode == "duplex" else model
         ref_path = self.config.reference_audio_path
         if ref_path.is_file():
-            self.ref_audio, _ = librosa.load(ref_path, sr=16000, mono=True)
+            self.ref_audio = _load_reference_audio(ref_path)
         logger.info("model loaded; mode=%s", self.config.model_mode)
 
     def prepare(self, uid: str, prompt: str) -> None:
@@ -115,4 +158,3 @@ class MiniCPMO45Runtime:
             "prepared_uid": self.prepared_uid,
             "streaming_prefill": signature,
         }
-

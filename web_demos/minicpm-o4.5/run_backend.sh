@@ -12,6 +12,6 @@ if [[ -f "${ENV_FILE:-$SCRIPT_DIR/.env}" ]]; then
 fi
 
 cd "$PROJECT_DIR"
+UVICORN_LOG_LEVEL="$(printf '%s' "${LOG_LEVEL:-info}" | tr '[:upper:]' '[:lower:]')"
 exec python -m uvicorn --app-dir "$SCRIPT_DIR" app.server:app \
-    --host 0.0.0.0 --port "${PORT:-32560}" --log-level "${LOG_LEVEL:-info}"
-
+    --host 0.0.0.0 --port "${PORT:-32560}" --log-level "$UVICORN_LOG_LEVEL"

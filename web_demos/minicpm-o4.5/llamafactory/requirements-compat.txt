@@ -1,0 +1,17 @@
+# Install this file after installing LLaMA-Factory at the pinned commit.
+# Keep the entire compatibility group together: upgrading only Transformers or
+# TRL lets pip select a combination that MiniCPM-o 4.5 cannot train with.
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+# CUDA 12.6 ABI-locked PyTorch stack. The +cu126 suffix prevents pip from
+# silently selecting a CPU or a wheel from another CUDA release.
+torch==2.8.0+cu126
+torchvision==0.23.0+cu126
+torchaudio==2.8.0+cu126
+
+numpy==1.26.4
+fsspec[http]==2025.3.0
+datasets==4.0.0
+transformers==4.51.0
+tokenizers==0.21.4
+trl==0.18.2

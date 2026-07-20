@@ -20,9 +20,18 @@
 ```bash
 python3.10 -m venv .venv-o45
 source .venv-o45/bin/activate
+python -m pip install --upgrade pip wheel
+python -m pip install "setuptools==80.9.0"
+# CUDA 12.6 wheel（驱动支持 CUDA 12.6 或更高时使用）
+python -m pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+  --index-url https://download.pytorch.org/whl/cu126
 pip install -r web_demos/minicpm-o4.5/requirements.txt
 cp web_demos/minicpm-o4.5/.env.example web_demos/minicpm-o4.5/.env
 ```
+
+`minicpmo-utils` 当前固定依赖 `librosa==0.9.0`，该版本依赖已经从 Setuptools 82 移除的
+`pkg_resources`。因此本目录固定 `setuptools==80.9.0` 并限制 `numpy<2`；不要在该环境中
+单独升级 setuptools、librosa 或 NumPy 2.x。
 
 机器还需要 NVIDIA 驱动、可用 CUDA 和 FFmpeg。不要把 `.env` 或患者音视频提交到 Git。
 
@@ -31,6 +40,7 @@ cp web_demos/minicpm-o4.5/.env.example web_demos/minicpm-o4.5/.env
 先不加载 LoRA：
 
 ```bash
+python web_demos/minicpm-o4.5/scripts/check_torch_stack.py
 python web_demos/minicpm-o4.5/scripts/smoke_model.py
 python web_demos/minicpm-o4.5/scripts/official_duplex_demo.py
 ```
@@ -83,6 +93,10 @@ python web_demos/minicpm-o4.5/scripts/build_llamafactory_dataset.py \
 使用包含 MiniCPM-o 4.5 支持的 LLaMA-Factory main 固定 commit，确认预处理 smoke test 后运行：
 
 ```bash
+# LlamaFactory v0.9.4 的依赖范围会选择不兼容的新版本，必须整组重新固定。
+pip install --upgrade --force-reinstall --no-cache-dir \
+  -r web_demos/minicpm-o4.5/llamafactory/requirements-compat.txt
+pip check
 bash web_demos/minicpm-o4.5/llamafactory/run_train.sh
 ```
 
