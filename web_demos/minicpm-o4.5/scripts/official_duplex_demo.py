@@ -21,11 +21,18 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio-npy", help="Optional 16 kHz float32 numpy array")
     parser.add_argument("--image")
+    parser.add_argument(
+        "--ref-audio",
+        help="Optional short 16 kHz mono reference WAV for duplex TTS",
+    )
     args = parser.parse_args()
 
     import numpy as np
 
-    runtime = MiniCPMO45Runtime(Settings(load_model=True, lora_adapter=""))
+    config = Settings(load_model=True, lora_adapter="")
+    if args.ref_audio:
+        config.ref_audio_path = args.ref_audio
+    runtime = MiniCPMO45Runtime(config)
     runtime.prepare("official-demo", "你是中医预问诊助手。请简短回应。")
     audio = np.load(args.audio_npy).astype("float32") if args.audio_npy else np.zeros(16000, dtype="float32")
     frames = [Image.open(args.image).convert("RGB")] if args.image else []
@@ -35,4 +42,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

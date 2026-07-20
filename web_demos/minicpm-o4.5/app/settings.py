@@ -26,7 +26,7 @@ class Settings:
 
     lora_adapter: str = ""
     merge_lora: bool = True
-    ref_audio_path: str = "assets/ref_audios/Wuweiping_test3_ref_16k_mono.wav"
+    ref_audio_path: str = "assets/ref_audios/Wuweiping_test3_ref_10s_16k_mono.wa"
 
     slot_config: str = "data/slots/doctor_wuweiping.json"
     slot_history_turns: int = 12
@@ -37,6 +37,20 @@ class Settings:
     slot_asr_model: str = "paraformer-realtime-v2"
     slot_asr_ws_url: str = ""
     slot_asr_vocabulary_id: str = ""
+
+    vision_vlm_base_url: str = ""
+    vision_vlm_api_key: str = ""
+    vision_vlm_model: str = ""
+
+    redis_url: str = ""
+    redis_key_prefix: str = "minicpmo45:consultation"
+    consultation_ttl_seconds: int = 604800
+
+    qiniu_access_key: str = ""
+    qiniu_secret_key: str = ""
+    qiniu_bucket_name: str = ""
+    qiniu_bucket_domain: str = ""
+    qiniu_key_prefix: str = "minicpmo45/consultations"
 
     rollout_percent: int = 0
     rollout_salt: str = "change-me-before-production"

@@ -18,6 +18,15 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, ge
 from starlette.responses import Response
 
 from .context import ConsultationContext
+from .image_analysis import (
+    SCENES,
+    SOURCES,
+    ImageAnalyzer,
+    QiniuImageStorage,
+    decode_image as decode_uploaded_image,
+    make_image_record,
+)
+from .persistence import ConsultationStore, utc_now
 from .protocol import InputChunk, encode_audio, parse_payload
 from .runtime import MiniCPMO45Runtime
 from .settings import settings
@@ -45,6 +54,7 @@ class Session:
     assistant_parts: list[str] = field(default_factory=list)
     pending_transcript: str = ""
     input_audio_parts: list[np.ndarray] = field(default_factory=list)
+    consultation_id: str = ""
 
     def touch(self) -> None:
         self.last_seen = time.time()
@@ -87,6 +97,9 @@ class SessionRegistry:
 
 
 runtime = MiniCPMO45Runtime(settings)
+consultation_store = ConsultationStore(settings)
+image_storage = QiniuImageStorage(settings)
+image_analyzer = ImageAnalyzer(settings)
 registry = SessionRegistry()
 
 
@@ -127,11 +140,26 @@ def _pcm_bytes(audio: np.ndarray | None) -> bytes | None:
 
 
 async def configure_session(session: Session, options: dict[str, Any]) -> None:
+    previous_consultation_id = session.consultation_id
     session.options.update(options)
-    session.context.reset(session.options)
+    session.consultation_id = str(
+        session.options.get("consultation_id") or previous_consultation_id or session.uid
+    ).strip()
+    if not session.started or session.consultation_id != previous_consultation_id:
+        session.context.reset(session.options)
+        persisted = await asyncio.to_thread(consultation_store.get, session.consultation_id)
+        if persisted:
+            session.context.restore(persisted)
     prompt = session.context.build_prompt()
     await asyncio.to_thread(runtime.prepare, session.uid, prompt)
     session.started = True
+    await asyncio.to_thread(
+        consultation_store.save_context,
+        session.consultation_id,
+        session.uid,
+        session.context.profile,
+        session.context.snapshot(),
+    )
 
 
 async def process_chunk(session: Session, chunk: InputChunk) -> dict[str, Any]:
@@ -172,6 +200,13 @@ async def process_chunk(session: Session, chunk: InputChunk) -> dict[str, Any]:
         # Refreshing at a turn boundary intentionally trades acoustic KV continuity for
         # deterministic slot/history injection. It never happens in the middle of speech.
         await asyncio.to_thread(runtime.prepare, session.uid, session.context.build_prompt())
+        await asyncio.to_thread(
+            consultation_store.save_context,
+            session.consultation_id or session.uid,
+            session.uid,
+            session.context.profile,
+            session.context.snapshot(),
+        )
 
     sampling_rate = int(result.get("sampling_rate") or 24000)
     response = {
@@ -198,10 +233,31 @@ async def process_chunk(session: Session, chunk: InputChunk) -> dict[str, Any]:
     return response
 
 
+async def cancel_session(session: Session) -> None:
+    """Discard an interrupted turn and reset the duplex model to saved context."""
+    INTERRUPTS.inc()
+    session.assistant_parts.clear()
+    session.pending_transcript = ""
+    session.input_audio_parts.clear()
+    # The legacy frontend aborts its current SSE request after /stop. Replacing the
+    # queue prevents chunks generated just before the interruption from leaking into
+    # the next SSE connection.
+    session.output_queue = asyncio.Queue()
+    await asyncio.to_thread(runtime.prepare, session.uid, session.context.build_prompt())
+
+
 @app.get("/health")
 @app.get("/api/v1/health")
 async def health() -> dict[str, Any]:
-    return {"status": "OK", **runtime.capabilities()}
+    return {
+        "status": "OK",
+        **runtime.capabilities(),
+        "integrations": {
+            "redis": consultation_store.configured,
+            "qiniu": image_storage.configured,
+            "vision_vlm": image_analyzer.configured,
+        },
+    }
 
 
 @app.get("/ready")
@@ -229,6 +285,8 @@ async def init_options(request: Request, uid: str | None = Header(None)) -> JSON
     return JSONResponse({
         "id": session.uid,
         "choices": {"role": "assistant", "content": "4.5", "finish_reason": "done"},
+        "consultation_id": session.consultation_id,
+        "next_media_request": session.context.next_media_request(),
     })
 
 
@@ -265,9 +323,7 @@ async def websocket_stream(websocket: WebSocket, uid: str | None = Query(None)) 
         while True:
             payload = json.loads(await websocket.receive_text())
             if payload.get("event") == "response.cancel":
-                INTERRUPTS.inc()
-                session.assistant_parts.clear()
-                await asyncio.to_thread(runtime.prepare, session.uid, session.context.build_prompt())
+                await cancel_session(session)
                 await websocket.send_json({"event": "response.cancelled", "id": uid})
                 continue
             result = await process_chunk(session, parse_payload(payload))
@@ -296,6 +352,22 @@ async def completions(uid: str | None = Header(None)) -> StreamingResponse:
     return StreamingResponse(_sse(session), media_type="text/event-stream")
 
 
+@app.post("/stop")
+@app.post("/api/v1/stop")
+async def stop_response(uid: str | None = Header(None)) -> JSONResponse:
+    """Compatibility endpoint used by the MiniCPM-o 2.6 HTTP/SSE frontend."""
+    session = await registry.get(require_uid(uid))
+    await cancel_session(session)
+    return JSONResponse({
+        "id": session.uid,
+        "choices": {
+            "role": "assistant",
+            "content": "success",
+            "finish_reason": "stop",
+        },
+    })
+
+
 @app.get("/api/v1/slots")
 async def get_slots(uid: str | None = Header(None)) -> JSONResponse:
     session = await registry.get(require_uid(uid))
@@ -316,6 +388,13 @@ async def update_slots(request: Request, uid: str | None = Header(None)) -> JSON
         if payload.get("assistant_text"):
             session.context.slots.record_assistant(str(payload["assistant_text"]))
     await asyncio.to_thread(runtime.prepare, session.uid, session.context.build_prompt())
+    await asyncio.to_thread(
+        consultation_store.save_context,
+        session.consultation_id or session.uid,
+        session.uid,
+        session.context.profile,
+        session.context.snapshot(),
+    )
     return JSONResponse(session.context.snapshot())
 
 
@@ -326,13 +405,128 @@ async def reset_slots(request: Request, uid: str | None = Header(None)) -> JSONR
     profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else {}
     if "visit_type" in payload:
         profile["visit_type"] = payload["visit_type"]
-    await configure_session(session, profile)
+    session.options.update(profile)
+    session.context.reset(session.options)
+    await asyncio.to_thread(runtime.prepare, session.uid, session.context.build_prompt())
+    await asyncio.to_thread(
+        consultation_store.save_context,
+        session.consultation_id or session.uid,
+        session.uid,
+        session.context.profile,
+        session.context.snapshot(),
+    )
     return JSONResponse(session.context.snapshot())
+
+
+@app.post("/api/v1/images/analyze")
+async def analyze_consultation_image(request: Request, uid: str | None = Header(None)) -> JSONResponse:
+    """Quality-check, analyze and persist a tongue, lesion or report image."""
+    session = await registry.get(require_uid(uid))
+    payload = await request.json()
+    scene = str(payload.get("scene") or "").strip().lower()
+    source = str(payload.get("source") or "manual_upload").strip().lower()
+    consultation_id = str(payload.get("consultation_id") or session.consultation_id or session.uid).strip()
+    image_data = payload.get("image_data")
+    mime_type = str(payload.get("mime_type") or "image/jpeg").lower()
+    if scene not in SCENES:
+        raise HTTPException(status_code=400, detail="scene must be tongue, lesion or report")
+    if source not in SOURCES:
+        raise HTTPException(status_code=400, detail="source must be assistant_requested or manual_upload")
+    if not isinstance(image_data, str) or not image_data:
+        raise HTTPException(status_code=400, detail="Missing base64 image_data")
+    if session.started and session.consultation_id and consultation_id != session.consultation_id:
+        raise HTTPException(status_code=409, detail="consultation_id does not match the active session")
+    if not consultation_store.configured:
+        raise HTTPException(status_code=503, detail="consultation Redis is not configured")
+    if not image_storage.configured:
+        raise HTTPException(status_code=503, detail="Qiniu image storage is not configured")
+    if not image_analyzer.configured:
+        raise HTTPException(status_code=503, detail="vision VLM is not configured")
+    if not session.started:
+        await configure_session(session, {"consultation_id": consultation_id})
+    try:
+        raw, _ = decode_uploaded_image(image_data, mime_type)
+        upload = await asyncio.to_thread(image_storage.upload, raw, consultation_id, scene, mime_type)
+        quality = await asyncio.to_thread(image_analyzer.quality_check, scene, image_data, mime_type)
+        analysis = None
+        if quality["passed"]:
+            analysis = await asyncio.to_thread(image_analyzer.analyze, scene, image_data, mime_type)
+        record = make_image_record(
+            consultation_id=consultation_id,
+            scene=scene,
+            source=source,
+            upload=upload,
+            quality=quality,
+            analysis=analysis,
+            model=settings.vision_vlm_model,
+        )
+        await asyncio.to_thread(consultation_store.append_image, consultation_id, session.uid, record)
+        if analysis is not None:
+            session.context.record_visual_observation(record)
+            await asyncio.to_thread(runtime.prepare, session.uid, session.context.build_prompt())
+            await asyncio.to_thread(
+                consultation_store.save_context,
+                consultation_id,
+                session.uid,
+                session.context.profile,
+                session.context.snapshot(),
+            )
+        return JSONResponse({
+            "id": session.uid,
+            "consultation_id": consultation_id,
+            "observation": record,
+            "next_media_request": session.context.next_media_request(),
+        })
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("image analysis failed")
+        if "upload" in locals():
+            failed_record = {
+                "observation_id": str(uuid.uuid4()),
+                "consultation_id": consultation_id,
+                "scene": scene,
+                "source": source,
+                **upload,
+                "status": "failed",
+                "quality_llm_result": locals().get("quality"),
+                "analysis_llm_result": None,
+                "error": type(exc).__name__,
+                "model": settings.vision_vlm_model,
+                "created_at": utc_now(),
+            }
+            await asyncio.to_thread(
+                consultation_store.append_image, consultation_id, session.uid, failed_record
+            )
+        raise HTTPException(status_code=502, detail="image analysis service failed") from exc
+
+
+@app.get("/api/v1/consultations/{consultation_id}")
+async def get_consultation(consultation_id: str, uid: str | None = Header(None)) -> JSONResponse:
+    owner_uid = require_uid(uid)
+    document = await asyncio.to_thread(consultation_store.get, consultation_id)
+    if not document or document.get("uid") != owner_uid:
+        raise HTTPException(status_code=404, detail="consultation not found")
+    return JSONResponse(document)
 
 
 @app.post("/api/v1/session/close")
 async def close_session(uid: str | None = Header(None)) -> dict[str, Any]:
-    await registry.remove(require_uid(uid))
+    owner_uid = require_uid(uid)
+    try:
+        session = await registry.get(owner_uid, create=False)
+    except KeyError:
+        return {"closed": True}
+    await asyncio.to_thread(
+        consultation_store.save_context,
+        session.consultation_id or session.uid,
+        session.uid,
+        session.context.profile,
+        session.context.snapshot(),
+    )
+    await registry.remove(owner_uid)
     return {"closed": True}
 
 

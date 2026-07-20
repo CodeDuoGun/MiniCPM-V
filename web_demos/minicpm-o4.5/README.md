@@ -69,6 +69,40 @@ curl http://127.0.0.1:32560/ready
 
 客户端最好附带浏览器/上游 ASR 的最终 `transcript`；否则可配置 DashScope ASR。
 
+### 图片质控、分析与问诊级存储
+
+初始化会话时在 `options` 中传入稳定的 `consultation_id`。助手会按舌面、患处、检查报告的顺序
+主动索取尚未完成的资料，用户也可随时主动上传。三类图片统一调用：
+
+```http
+POST /api/v1/images/analyze
+uid: patient-or-session-id
+Content-Type: application/json
+
+{
+  "consultation_id": "consultation-20260720-001",
+  "scene": "tongue",
+  "source": "assistant_requested",
+  "mime_type": "image/jpeg",
+  "image_data": "<base64，不含 data URL 前缀>"
+}
+```
+
+`scene` 为 `tongue|lesion|report`，`source` 为 `assistant_requested|manual_upload`。接口先调用
+VLM 质控；质控通过后才执行结构化分析并写入病情槽位。质控不通过的图片和质控结论仍会保存，
+但不会进入模型后续问诊上下文。检查报告必须使用该显式上传接口，不允许从实时视频帧读取。
+
+图片经 `utils/qiniu_lib.py` 上传，Redis 按
+`<REDIS_KEY_PREFIX>:<consultation_id>` 保存患者基本信息、槽位病情、对话、图片 HTTP 地址、
+质控结果和分析结果。可通过以下接口查询完整记录：
+
+```http
+GET /api/v1/consultations/{consultation_id}
+uid: patient-or-session-id
+```
+
+生产环境必须配置 `VISION_VLM_*`、`REDIS_URL` 和 `QINIU_*`；密钥只放环境变量，不写入仓库。
+
 ## 4. LLaMA-Factory 数据与 LoRA
 
 已生成：

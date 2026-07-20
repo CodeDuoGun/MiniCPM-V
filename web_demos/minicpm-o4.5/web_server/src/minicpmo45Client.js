@@ -1,11 +1,29 @@
 /** MiniCPM-o 4.5 full-duplex client. Payloads remain compatible with the 2.6 UI. */
 export class MiniCPMO45Client {
     constructor({ baseUrl, uid, onChunk, onError }) {
-        this.baseUrl = baseUrl.replace(/^http/, 'ws').replace(/\/$/, '');
+        this.httpBaseUrl = baseUrl.replace(/\/$/, '');
+        this.baseUrl = this.httpBaseUrl.replace(/^http/, 'ws');
         this.uid = uid;
         this.onChunk = onChunk || (() => {});
         this.onError = onError || console.error;
         this.socket = null;
+    }
+
+    async analyzeImage({ consultationId, scene, imageBase64, mimeType = 'image/jpeg', source = 'manual_upload' }) {
+        const response = await fetch(`${this.httpBaseUrl}/api/v1/images/analyze`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', uid: this.uid },
+            body: JSON.stringify({
+                consultation_id: consultationId,
+                scene,
+                source,
+                mime_type: mimeType,
+                image_data: imageBase64
+            })
+        });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.detail || `Image analysis failed: ${response.status}`);
+        return result;
     }
 
     connect() {
@@ -50,4 +68,3 @@ export class MiniCPMO45Client {
         this.socket?.close(1000, 'consultation finished');
     }
 }
-

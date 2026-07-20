@@ -447,6 +447,39 @@ class SlotConversation:
             self.history.append({"role": "assistant", "content": text})
             self.history = self.history[-self.history_turns * 2 :]
 
+    def record_tool(self, text: str, **metadata: Any) -> None:
+        text = str(text or "").strip()
+        if text:
+            event: Dict[str, Any] = {"role": "tool", "content": text}
+            event.update({key: value for key, value in metadata.items() if value not in (None, "")})
+            self.history.append(event)
+            self.history = self.history[-self.history_turns * 2 :]
+
+    def restore(self, snapshot: Mapping[str, Any]) -> None:
+        """Restore bounded state previously persisted for the same consultation."""
+        self.visit_type = normalize_visit_type(snapshot.get("visit_type", self.visit_type))
+        self.definitions = self._load_definitions(self.visit_type)
+        self.values = {}
+        for item in snapshot.get("slots") or []:
+            if not isinstance(item, Mapping) or item.get("status") != "filled":
+                continue
+            name = str(item.get("name") or "")
+            if not name or item.get("value") in (None, ""):
+                continue
+            self.values[name] = SlotValue(
+                value=item["value"],
+                evidence=str(item.get("evidence") or "Redis恢复")[:300],
+                confidence=float(item.get("confidence", 1.0)),
+                updated_turn=int(item.get("updated_turn", 0)),
+                source=str(item.get("source") or "redis"),
+            )
+        self.signals = dict(snapshot.get("signals") or {})
+        self.history = [dict(item) for item in (snapshot.get("history") or []) if isinstance(item, Mapping)]
+        self.history = self.history[-self.history_turns * 2 :]
+        self.turn_id = int(snapshot.get("turn_id") or 0)
+        self.last_user_text = str(snapshot.get("last_user_text") or "")
+        self.last_error = ""
+
     def set_external_value(self, name: str, value: Any, evidence: str = "外部资料") -> bool:
         self.turn_id = max(1, self.turn_id)
         return bool(self.apply_updates([{
