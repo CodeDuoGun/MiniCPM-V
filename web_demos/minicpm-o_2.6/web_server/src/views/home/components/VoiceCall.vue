@@ -47,7 +47,7 @@
     </div>
 </template>
 <script setup>
-    import { sendMessage, stopMessage, uploadConfig } from '@/apis';
+    import { closeSession, sendMessage, stopMessage, uploadConfig } from '@/apis';
     import { encodeWAV } from '@/hooks/useVoice';
     import { getNewUserId, setNewUserId } from '@/hooks/useRandomId';
     import { fetchEventSource } from '@microsoft/fetch-event-source';
@@ -255,7 +255,7 @@
         skipDisabled.value = true;
         playing.value = false;
         audioDOM.pause();
-        stopMessage();
+        stopMessage().then(() => closeSession());
         if (socket) {
             socket.close();
         }

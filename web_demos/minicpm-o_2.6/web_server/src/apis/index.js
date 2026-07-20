@@ -6,6 +6,10 @@ export const sendMessage = data => {
 export const stopMessage = () => {
     return useHttp.post('/api/v1/stop');
 };
+// 结束通话后释放后端的单 GPU 会话槽位。
+export const closeSession = () => {
+    return useHttp.post('/api/v1/session/close');
+};
 // 上传音色文件
 export const uploadFile = data => {
     return useHttp.post('/api/v1/upload_audio', data);

@@ -362,6 +362,7 @@
     "useId": true,
     "useModel": true,
     "useTemplateRef": true,
-    "analyzeUploadedReport": true
+    "analyzeUploadedReport": true,
+    "closeSession": true
   }
 }

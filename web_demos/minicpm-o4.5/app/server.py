@@ -243,7 +243,8 @@ async def cancel_session(session: Session) -> None:
     # queue prevents chunks generated just before the interruption from leaking into
     # the next SSE connection.
     session.output_queue = asyncio.Queue()
-    await asyncio.to_thread(runtime.prepare, session.uid, session.context.build_prompt())
+    if session.started:
+        await asyncio.to_thread(runtime.prepare, session.uid, session.context.build_prompt())
 
 
 @app.get("/health")
@@ -356,10 +357,17 @@ async def completions(uid: str | None = Header(None)) -> StreamingResponse:
 @app.post("/api/v1/stop")
 async def stop_response(uid: str | None = Header(None)) -> JSONResponse:
     """Compatibility endpoint used by the MiniCPM-o 2.6 HTTP/SSE frontend."""
-    session = await registry.get(require_uid(uid))
-    await cancel_session(session)
+    requested_uid = require_uid(uid)
+    try:
+        session = await registry.get(requested_uid, create=False)
+    except KeyError:
+        # The legacy UI probes /stop when a page is mounted, then creates a new UID
+        # when the call starts. A probe must not occupy the single model session.
+        session = None
+    if session is not None:
+        await cancel_session(session)
     return JSONResponse({
-        "id": session.uid,
+        "id": requested_uid,
         "choices": {
             "role": "assistant",
             "content": "success",
@@ -418,12 +426,14 @@ async def reset_slots(request: Request, uid: str | None = Header(None)) -> JSONR
     return JSONResponse(session.context.snapshot())
 
 
+@app.post("/api/v1/reports/analyze")
 @app.post("/api/v1/images/analyze")
 async def analyze_consultation_image(request: Request, uid: str | None = Header(None)) -> JSONResponse:
     """Quality-check, analyze and persist a tongue, lesion or report image."""
     session = await registry.get(require_uid(uid))
     payload = await request.json()
-    scene = str(payload.get("scene") or "").strip().lower()
+    legacy_report_request = request.url.path == "/api/v1/reports/analyze"
+    scene = str(payload.get("scene") or ("report" if legacy_report_request else "")).strip().lower()
     source = str(payload.get("source") or "manual_upload").strip().lower()
     consultation_id = str(payload.get("consultation_id") or session.consultation_id or session.uid).strip()
     image_data = payload.get("image_data")
@@ -475,6 +485,9 @@ async def analyze_consultation_image(request: Request, uid: str | None = Header(
             "id": session.uid,
             "consultation_id": consultation_id,
             "observation": record,
+            # Compatibility fields consumed by the legacy report uploader.
+            "analysis": analysis or {},
+            "disclaimer": "结果仅用于预问诊信息整理，不能替代医生诊断。",
             "next_media_request": session.context.next_media_request(),
         })
     except ValueError as exc:

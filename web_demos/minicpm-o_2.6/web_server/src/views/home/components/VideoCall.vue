@@ -84,7 +84,7 @@
     </div>
 </template>
 <script setup>
-    import { analyzeUploadedReport, sendMessage, stopMessage, uploadConfig } from '@/apis';
+    import { analyzeUploadedReport, closeSession, sendMessage, stopMessage, uploadConfig } from '@/apis';
     import { encodeWAV } from '@/hooks/useVoice';
     import { getNewUserId, setNewUserId } from '@/hooks/useRandomId';
     import { fetchEventSource } from '@microsoft/fetch-event-source';
@@ -572,7 +572,7 @@
         playing.value = false;
         audioDOM?.pause();
         closeDigitalHuman();
-        stopMessage();
+        stopMessage().then(() => closeSession());
         if (socket) {
             socket.close();
         }

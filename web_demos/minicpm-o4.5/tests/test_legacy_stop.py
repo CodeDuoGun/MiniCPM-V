@@ -28,3 +28,4 @@ def test_legacy_stop_endpoint_resets_pending_turn(monkeypatch):
             "finish_reason": "stop",
         },
     }
+    assert server.registry.sessions == {}
