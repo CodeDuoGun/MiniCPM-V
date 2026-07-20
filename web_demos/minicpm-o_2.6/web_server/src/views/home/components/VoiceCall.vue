@@ -73,7 +73,6 @@
     const textQueue = ref('');
     const textAnimationInterval = ref();
 
-    const isFirstReturn = ref(true); // 首次返回的音频是前端发给后端的音频片段，需要单独处理
 
     const audioPlayQueue = ref([]);
     const base64List = ref([]);
@@ -364,7 +363,6 @@
             async onopen(response) {
                 console.log('onopen', response);
                 isFirstPiece.value = true;
-                isFirstReturn.value = true;
                 allVoice.value = [];
                 base64List.value = [];
                 if (response.status !== 200) {
@@ -396,33 +394,12 @@
                 if (data.response_id) {
                     curResponseId.value = data.response_id;
                 }
+                if (outputData.value[outputData.value.length - 1]?.type !== 'BOT') {
+                    outputData.value.push({ type: 'BOT', text: '', audio: '' });
+                }
                 if (choice.text) {
                     textQueue.value += choice.text.replace('<end>', '');
                     console.warn('text return time -------------------------------', +new Date());
-                }
-                // 首次返回的是前端发给后端的音频片段，需要单独处理
-                if (isFirstReturn.value) {
-                    console.log('第一次');
-                    isFirstReturn.value = false;
-                    // 如果后端返回的音频为空，需要重连
-                    if (!choice.audio) {
-                        if (finished) {
-                            isEnd.value = true;
-                            return;
-                        }
-                        buildConnect();
-                        return;
-                    }
-                    outputData.value.push({
-                        type: 'USER',
-                        audio: `data:audio/wav;base64,${choice.audio}`
-                    });
-                    outputData.value.push({
-                        type: 'BOT',
-                        text: '',
-                        audio: ''
-                    });
-                    return;
                 }
                 if (choice.audio) {
                     console.warn('audio return time -------------------------------', +new Date());
@@ -432,9 +409,6 @@
                         addAudioQueue(() => truePlay(choice.audio));
                     }
                     allVoice.value.push(`data:audio/wav;base64,${choice.audio}`);
-                } else if (!finished) {
-                    // 发生异常了，直接重连
-                    buildConnect();
                 }
                 if (finished) {
                     isEnd.value = true;

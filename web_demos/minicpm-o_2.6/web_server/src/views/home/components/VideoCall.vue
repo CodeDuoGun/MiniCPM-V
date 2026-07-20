@@ -118,7 +118,6 @@
     const taskQueue = ref([]);
     const running = ref(false);
     const outputData = ref([]);
-    const isFirstReturn = ref(true);
     const audioPlayQueue = ref([]);
     const base64List = ref([]);
     const playing = ref(false);
@@ -136,6 +135,7 @@
     const isFrontCamera = ref(true);
     const loading = ref(false);
     const reportUploading = ref(false);
+    const backendReady = ref(false);
 
     const isEnd = ref(false); // sse接口关闭，认为模型已完成本次返回
 
@@ -252,32 +252,34 @@
         // The backend binds its single duplex session to the UID used during
         // init_options, so generate the call UID before uploading configuration.
         setNewUserId();
-        uploadUserConfig()
-            .then(async () => {
-                if (!audioDOM) {
-                    audioDOM = new Audio();
-                    audioDOM.playsinline = true;
-                    audioDOM.preload = 'auto';
-                }
-                await initVideoStream('environment');
-                if (digitalHumanEnabled.value) {
-                    await initDigitalHuman();
-                }
-                buildConnect();
-                await delay(100);
-                // if (socket) {
-                //     socket.close();
-                // }
-                // socket = new WebSocketService(
-                //     `/ws/stream${window.location.search}&uid=${getNewUserId()}&service=minicpmo-server`
-                // );
-                // socket.connect();
-                if (localStorage.getItem('canStopByVoice') === 'true') {
-                    console.log('vad start');
-                    vadStart();
-                }
-            })
-            .catch(() => {});
+        backendReady.value = false;
+        try {
+            if (!audioDOM) {
+                audioDOM = new Audio();
+                audioDOM.playsinline = true;
+                audioDOM.preload = 'auto';
+            }
+            // Show the local camera immediately. MiniCPM prepare() initializes the
+            // reference voice and system KV cache and can take several seconds.
+            await initVideoStream('environment');
+            await uploadUserConfig();
+            if (digitalHumanEnabled.value) {
+                await initDigitalHuman();
+            }
+            buildConnect();
+            backendReady.value = true;
+            await delay(100);
+            if (localStorage.getItem('canStopByVoice') === 'true') {
+                console.log('vad start');
+                vadStart();
+            }
+        } catch (error) {
+            backendReady.value = false;
+            loading.value = false;
+            isCalling.value = false;
+            destroyVideoStream();
+            ElMessage.error(error?.message || '无法启动摄像头、麦克风或模型会话');
+        }
     };
     // 切换摄像头
     const switchCamera = () => {
@@ -326,6 +328,10 @@
 
                 processor.onaudioprocess = event => {
                     if (!isCalling.value) return;
+                    if (!backendReady.value) {
+                        audioChunks = [];
+                        return;
+                    }
                     if (isReturnError.value) {
                         stopRecording();
                         return;
@@ -359,7 +365,17 @@
 
                 audioSource.connect(processor);
                 processor.connect(audioContext.destination);
-            } catch {}
+            } catch (error) {
+                loading.value = false;
+                isCalling.value = false;
+                const permissionMessage =
+                    error?.name === 'NotAllowedError'
+                        ? '摄像头或麦克风权限被拒绝，请在浏览器地址栏中允许后重试'
+                        : error?.name === 'NotFoundError'
+                          ? '没有找到可用的摄像头或麦克风'
+                          : `打开摄像头或麦克风失败：${error?.message || error}`;
+                throw new Error(permissionMessage);
+            }
         }
     };
     const waitForIceGathering = peer => {
@@ -550,6 +566,7 @@
         return result;
     };
     const stopRecording = () => {
+        backendReady.value = false;
         isCalling.value = false;
         clearInterval(interval.value);
         interval.value = null;
@@ -618,7 +635,6 @@
             openWhenHidden: true,
             async onopen(response) {
                 isFirstPiece.value = true;
-                isFirstReturn.value = true;
                 allVoice.value = [];
                 base64List.value = [];
                 console.log('onopen', response);
@@ -650,6 +666,9 @@
                 if (data.response_id) {
                     curResponseId.value = data.response_id;
                 }
+                if (outputData.value[outputData.value.length - 1]?.type !== 'BOT') {
+                    outputData.value.push({ type: 'BOT', text: '', audio: '' });
+                }
                 if (choice.digital_human_audio === false) {
                     console.warn('数字人音频注入失败，本段回退为浏览器原始音频播放');
                     digitalHumanReady.value = false;
@@ -657,30 +676,6 @@
                 if (choice.text) {
                     textQueue.value += choice.text.replace('<end>', '');
                     console.warn('text return time -------------------------------', +new Date());
-                }
-                // 首次返回的是前端发给后端的音频片段，需要单独处理
-                if (isFirstReturn.value) {
-                    console.log('第一次');
-                    isFirstReturn.value = false;
-                    // 如果后端返回的音频为空，需要重连
-                    if (!choice.audio) {
-                        if (finished) {
-                            isEnd.value = true;
-                            return;
-                        }
-                        buildConnect();
-                        return;
-                    }
-                    outputData.value.push({
-                        type: 'USER',
-                        audio: `data:audio/wav;base64,${choice.audio}`
-                    });
-                    outputData.value.push({
-                        type: 'BOT',
-                        text: '',
-                        audio: ''
-                    });
-                    return;
                 }
                 if (choice.audio) {
                     console.log('audio return time -------------------------------', +new Date());
@@ -690,9 +685,6 @@
                         addAudioQueue(() => truePlay(choice.audio));
                     }
                     allVoice.value.push(`data:audio/wav;base64,${choice.audio}`);
-                } else if (!finished) {
-                    // 发生异常了，直接重连
-                    buildConnect();
                 }
                 if (finished) {
                     isEnd.value = true;
@@ -908,7 +900,7 @@
         interval.value = null;
     };
     const dealImage = () => {
-        if (!videoRef.value) {
+        if (!videoRef.value || !videoRef.value.videoWidth || !videoRef.value.videoHeight) {
             return;
         }
         const canvas = canvasRef.value;

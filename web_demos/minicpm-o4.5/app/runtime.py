@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 import threading
+import time
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,7 @@ class MiniCPMO45Runtime:
         self.ref_audio: np.ndarray | None = None
         self.lock = threading.RLock()
         self.prepared_uid = ""
+        self._tts_prepare_cache: dict[str, Any] | None = None
         if config.load_model:
             self.load()
 
@@ -110,16 +112,38 @@ class MiniCPMO45Runtime:
             self.prepared_uid = uid
             return
         with self.lock:
+            started = time.perf_counter()
             if self.config.model_mode == "duplex":
                 kwargs: dict[str, Any] = {"prefix_system_prompt": prompt}
                 if self.ref_audio is not None:
                     kwargs["ref_audio"] = self.ref_audio
-                    kwargs["prompt_wav_path"] = str(self.config.reference_audio_path)
+                    if self._tts_prepare_cache is None:
+                        kwargs["prompt_wav_path"] = str(self.config.reference_audio_path)
                 self.model.prepare(**kwargs)
+                if self.ref_audio is not None:
+                    if self._tts_prepare_cache is None and getattr(self.model, "token2wav_initialized", False):
+                        self._tts_prepare_cache = {
+                            "flow_cache_base": self.model.flow_cache_base,
+                            "hift_cache_base": self.model.hift_cache_base,
+                            "pre_lookahead": self.model.pre_lookahead,
+                        }
+                    elif self._tts_prepare_cache is not None:
+                        # prepare() clears these immutable base caches. Restore them
+                        # and let the official helper clone fresh per-turn state.
+                        for name, value in self._tts_prepare_cache.items():
+                            setattr(self.model, name, value)
+                        self.model.token2wav_initialized = True
+                        self.model._reset_token2wav_for_new_turn()
             else:
                 if hasattr(self.model, "reset_session"):
                     self.model.reset_session()
             self.prepared_uid = uid
+            logger.info(
+                "prepared session uid=%s in %.2fs (cached_token2wav=%s)",
+                uid,
+                time.perf_counter() - started,
+                self._tts_prepare_cache is not None,
+            )
 
     def process_duplex_chunk(self, audio: np.ndarray | None, frames: list[Any]) -> dict[str, Any]:
         if not self.loaded:
